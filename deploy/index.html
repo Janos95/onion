@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Wasm Bindgen Example</title>
+  </head>
+  <body>
+    <script type="module">
+      import init from './onion.js';
+
+      async function run() {
+        const wasm = await init();
+        console.log(wasm.main());
+      }
+
+      run();
+    </script>
+  </body>
+</html>

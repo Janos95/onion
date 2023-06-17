@@ -153,7 +153,7 @@ fn origin_square(m : Move) -> Square {
 struct Position {
     positions: [Bitboard; 7], // empty, pawn, knight, bishop, rook, queen, king
     colors: [Bitboard; 2], // white, black
-    pieces: [Piece; 64],
+    by_piece: [Piece; 64],
     side_to_move : Color,
 }
 
@@ -170,7 +170,7 @@ impl Position {
         let mut position = Position {
             positions: [0; 7],
             colors: [0; 2],
-            pieces: INITIAL_PIECES,
+            by_piece: INITIAL_PIECES,
             side_to_move: Color::White,
         };
 
@@ -184,10 +184,14 @@ impl Position {
             }
         }
 
-        println!("white pieces {}", position.colors[0]);
-        println!("black pieces {}", position.colors[1]);
+        //println!("white pieces {}", position.colors[0]);
+        //println!("black pieces {}", position.colors[1]);
 
         position
+    }
+
+    fn pieces(&self, c : Color, kind : PieceKind) -> Bitboard {
+        self.colors[c as usize] & self.positions[kind as usize]
     }
 
     fn do_move(&mut self, m : Move) {
@@ -207,16 +211,16 @@ impl Position {
         // set origin to empty and 
         set_square(&mut self.positions[PieceKind::Empty as usize], origin);
 
-        let moving_piece_kind = self.pieces[origin as usize].kind() as usize;
-        let target_piece_kind = self.pieces[destination as usize].kind() as usize;
+        let moving_piece_kind = self.by_piece[origin as usize].kind() as usize;
+        let target_piece_kind = self.by_piece[destination as usize].kind() as usize;
 
         unset_square(&mut self.positions[moving_piece_kind], origin);
         unset_square(&mut self.positions[target_piece_kind], destination);
         set_square(&mut self.positions[moving_piece_kind], destination);
 
         // explicit piece array
-        self.pieces[destination as usize] = self.pieces[origin as usize];
-        self.pieces[origin as usize] = Piece::Empty;
+        self.by_piece[destination as usize] = self.by_piece[origin as usize];
+        self.by_piece[origin as usize] = Piece::Empty;
 
         self.side_to_move = self.side_to_move.opposite();
 
@@ -241,7 +245,7 @@ impl Position {
 
     fn is_consistent(&self) -> bool {
         for i in 0..64 {
-            let piece = self.pieces[i as usize];
+            let piece = self.by_piece[i as usize];
             let bb : u64 = 1 << i as u64;
             if self.positions[piece.kind() as usize] & bb == 0 {
                 return false;
@@ -281,13 +285,17 @@ struct Moves {
     num_moves : usize,
 }
 
-fn create_move(origin : Square, destination : Square, promotion : PieceKind, move_type : MoveType) -> Move {
-        let mut m = destination;
-        m |= origin << 6;
-        m |= (promotion as u32) << 12;
-        m |= (move_type as u32) << 14;
-        m
-    }
+fn create_move_advanced(origin : Square, destination : Square, promotion : PieceKind, move_type : MoveType) -> Move {
+    let mut m = destination;
+    m |= origin << 6;
+    m |= (promotion as u32) << 12;
+    m |= (move_type as u32) << 14;
+    m
+}
+
+fn create_move(origin : Square, destination : Square) -> Move {
+    create_move_advanced(origin, destination, PieceKind::Empty, MoveType::Normal)
+}
 
 impl Moves {
     fn new() -> Moves {
@@ -356,6 +364,55 @@ fn pawn_push(c : Color) -> Direction {
     }
 }
 
+fn to_bb(s : Square) -> Bitboard{
+    1 << s as u64
+}
+
+fn get_attacks(from : Square, pos : &Position, piece_kind : PieceKind) -> Bitboard {
+    if piece_kind == PieceKind::Knight {
+        let x0 = (from % 8) as i32;
+        let y0 = (from / 8) as i32;
+        let mut b : u64 = 0;
+        for (x,y) in [(2,1), (2,-1), (-2,1), (-2,-1), (2,1), (2,-1), (-2,1), (-2,-1)] {
+            let x1 = x0 + x;
+            let y1 = y0 + y;
+            if x1 >=0 && x1 < 8 && y1 >= 0 && y1 < 8 {
+                let s = (8 * y1 + x1) as Square;
+                b |= to_bb(s);
+            }
+        }
+        return b;
+    }
+    0
+}
+
+fn generate_moves(pos : &Position, moves : &mut Moves, target : Bitboard, piece_kind : PieceKind) {
+
+  assert!(piece_kind != PieceKind::King && piece_kind != PieceKind::Pawn, "Unsupported piece type");
+
+  let us = pos.side_to_move;
+
+  let mut bb = pos.pieces(us, piece_kind);
+
+  let mask = !pos.colors[us as usize];
+
+  while bb != 0
+  {
+    let from = pop_square(&mut bb);
+    let mut b = get_attacks(from, pos, piece_kind) & mask;
+
+    //println!("num knight attacks {}", b.count_ones());
+
+      // To check, you either move freely a blocker or make a direct check.
+      //if (Checks && (Pt == QUEEN || !(pos.blockers_for_king(~Us) & from)))
+      //    b &= pos.check_squares(Pt);
+
+      while b != 0 {
+        moves.push(create_move(from, pop_square(&mut b)));
+      }
+  }
+}
+
 fn generate_pawn_moves(position : &Position, moves : &mut Moves) {
     let us_color = position.side_to_move;
     let us = us_color as usize;
@@ -365,7 +422,7 @@ fn generate_pawn_moves(position : &Position, moves : &mut Moves) {
     let up_right = if us_color == Color::White {Direction::NorthEast} else {Direction::SouthEast};
     let up_left = if us_color == Color::White {Direction::NorthWest} else {Direction::SouthWest};
 
-    println!("us {:?}", us);
+    //println!("us {:?}", us);
 
     let empty = position.positions[PieceKind::Empty as usize];
     let pawns = position.colors[us] & position.positions[PieceKind::Pawn as usize];
@@ -379,16 +436,16 @@ fn generate_pawn_moves(position : &Position, moves : &mut Moves) {
         while b1 != 0 {
             let destination = pop_square(&mut b1);
             let origin = destination as i32 - up_right as i32; 
-            println!("generating pawn capture {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination, PieceKind::Empty, MoveType::Normal));
+            //println!("generating pawn capture {} -> {}", origin, destination);
+            moves.push(create_move(origin as u32, destination));
         }
 
         let mut b2 = shift(b, Direction::West) & enemies;
         while b2 != 0 {
             let destination = pop_square(&mut b2);
             let origin = destination as i32 - up_left as i32; 
-            println!("generating pawn capture {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination, PieceKind::Empty, MoveType::Normal));
+            //println!("generating pawn capture {} -> {}", origin, destination);
+            moves.push(create_move(origin as u32, destination));
         }
     }
 
@@ -399,26 +456,28 @@ fn generate_pawn_moves(position : &Position, moves : &mut Moves) {
         while b1 != 0 {
             let destination = pop_square(&mut b1);
             let origin = destination as i32 - up as i32;
-            println!("generating single push move {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination, PieceKind::Empty, MoveType::Normal));
+            //println!("generating single push move {} -> {}", origin, destination);
+            moves.push(create_move(origin as u32, destination));
         }
 
         // double pawn push
         let mut b2 = shift(b & empty & DOUBLE_PUSH_MASK[us], up) & empty;
 
-        println!("num double pushes {}",b2.count_ones());
+        //println!("num double pushes {}",b2.count_ones());
 
         while b2 != 0 {
             let destination = pop_square(&mut b2);
             let origin = destination as i32 - 2*(up as i32);
-            println!("generating two push move {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination, PieceKind::Empty, MoveType::Normal));
+            //println!("generating two push move {} -> {}", origin, destination);
+            moves.push(create_move(origin as u32, destination));
         }
     }
 }
 
-fn generate_moves(position : &Position) -> Moves {
+fn generate_all_moves(position : &Position) -> Moves {
     let mut moves = Moves::new();
+    let target = !position.colors[position.side_to_move as usize];
+    generate_moves(position, &mut moves, target, PieceKind::Knight);
     generate_pawn_moves(position, &mut moves);
     moves
 }
@@ -427,7 +486,7 @@ fn alpha_beta_search(position : &Position, depth : usize, alpha_ : i32, beta_ : 
     if depth == 0 {
         return position.value() as i32;
     }
-    let moves = generate_moves(position);
+    let moves = generate_all_moves(position);
     if moves.num_moves == 0  {
         return position.value() as i32;
     }
@@ -464,16 +523,16 @@ fn alpha_beta_search(position : &Position, depth : usize, alpha_ : i32, beta_ : 
 }
 
 fn make_move(position : &mut Position) {
-    let moves = generate_moves(position);
+    let moves = generate_all_moves(position);
     let mut best_move = 0;
-    let mut best_value = i32::MAX;
+    let mut best_value = i32::MIN;
     for m in moves.iter() {
-        //let v = alpha_beta_search(position, 5, i32::MIN, i32::MAX, true);
-        let mut p = position.clone();
-        p.do_move(m);
-        let v = p.value() as i32;
+        let v = alpha_beta_search(position, 3, i32::MIN, i32::MAX, true);
+        //let mut p = position.clone();
+        //p.do_move(m);
+        //let v = p.value() as i32;
         // choose position which has the lowest valuation for the opponent
-        if v < best_value {
+        if v > best_value {
             best_move = m;
             best_value = v;
         }
@@ -494,7 +553,7 @@ impl GpuBoard {
     fn new(pos : &Position) -> GpuBoard {
         let mut board = GpuBoard{ pieces : [0; 64]};
         for i in 0..64 {
-           board.pieces[i] = pos.pieces[i] as i32;
+           board.pieces[i] = pos.by_piece[i] as i32;
         }
         board
     }
@@ -625,6 +684,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let mut i = 0;
     let mut mouse_positions: [PhysicalPosition<f64>; 2] = [winit::dpi::PhysicalPosition::default(); 2];
     let mut move_piece = false;
+    let mut waiting_for_promotion = false;
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
@@ -651,8 +711,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             } => {
                 if button == MouseButton::Left {
                     mouse_down = state == winit::event::ElementState::Pressed;
+
                     if !mouse_down {
-                        mouse_positions[i] = current_mouse_pos.unwrap();
+                        let mouse_pos : PhysicalPosition<f64> = current_mouse_pos.unwrap();
+                        mouse_positions[i] = mouse_pos;
                         move_piece = i == 1;
                         i = (i + 1) % 2;
                     }
@@ -665,9 +727,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         let height = window_size.height as f64;
                         let width = window_size.width as f64;
 
-                        println!("{}, {}", last_pos.x, last_pos.y);
-                        println!("{}, {}", current_pos.x, current_pos.y);
-                        println!("{}, {}", width, height);
+                        //println!("{}, {}", last_pos.x, last_pos.y);
+                        //println!("{}, {}", current_pos.x, current_pos.y);
+                        //println!("{}, {}", width, height);
 
                         let square_size = 1./8.;
 
@@ -684,8 +746,15 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                         
                         //println!("{} -> {}", from, to);
 
-                        let m = create_move(from as u32, to as u32, PieceKind::Bishop, MoveType::Normal);
+                        let m = create_move(from as u32, to as u32);
+
+                        let rank = to / 8;
+                        if position.by_piece[from as usize].kind() == PieceKind::Pawn && (rank == 0 || rank == 7) {
+                            waiting_for_promotion = true;
+                        }
+
                         position.do_move(m);
+                        
 
                         //println!("computing moves for color {:?}", position.side_to_move);
                         //for m in generate_moves(&position).iter() {
@@ -766,6 +835,7 @@ fn main() {
     {
         std::panic::set_hook(Box::new(console_error_panic_hook::hook));
         console_log::init().expect("could not initialize logger");
+
         use winit::platform::web::WindowExtWebSys;
         // On wasm, append the canvas to the document body
         web_sys::window()
