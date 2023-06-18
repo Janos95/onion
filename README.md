@@ -1,3 +1,3 @@
 # onion
 
-[Play Now!](https://janos95.github.io/onion/).
+[Play Now!](https://janos95.github.io/onion/)
