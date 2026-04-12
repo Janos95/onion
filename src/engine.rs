@@ -1,7 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 const INITIAL_PIECES: [Piece; 64] = [
     Piece::WhiteRook,
@@ -100,6 +100,12 @@ const TT_BITS: usize = 18;
 const TT_SIZE: usize = 1 << TT_BITS;
 const TIME_CHECK_INTERVAL: u64 = 1 << 10;
 const ZOBRIST_SEED_INC: u64 = 0x9E37_79B9_7F4A_7C15;
+
+#[cfg(not(target_arch = "wasm32"))]
+type SearchDeadline = Instant;
+
+#[cfg(target_arch = "wasm32")]
+type SearchDeadline = f64;
 
 type Bitboard = u64;
 pub type Square = u32;
@@ -763,11 +769,11 @@ impl Searcher {
             _ => {}
         }
 
-        let deadline = Instant::now() + time_budget;
+        let deadline = deadline_after(time_budget);
         let mut best_completed = None;
 
         for depth in 1..=MAX_SEARCH_DEPTH {
-            if Instant::now() >= deadline {
+            if deadline_reached(deadline) {
                 break;
             }
 
@@ -786,7 +792,7 @@ impl Searcher {
         &mut self,
         position: &mut Position,
         depth: usize,
-        deadline: Option<Instant>,
+        deadline: Option<SearchDeadline>,
     ) -> Result<Option<(Move, SearchStats)>, SearchAborted> {
         let mut moves = generate_legal_moves(position);
         if moves.num_moves == 0 {
@@ -841,7 +847,7 @@ impl Searcher {
         mut alpha: i32,
         beta: i32,
         stats: &mut SearchStats,
-        deadline: Option<Instant>,
+        deadline: Option<SearchDeadline>,
     ) -> Result<i32, SearchAborted> {
         stats.nodes += 1;
         if search_timed_out(deadline, stats.nodes) {
@@ -949,11 +955,30 @@ pub fn search_root_with_stats(position: &Position, depth: usize) -> Option<Searc
     Searcher::new().search_root_with_stats(position, depth)
 }
 
-fn search_timed_out(deadline: Option<Instant>, nodes: u64) -> bool {
-    deadline.is_some_and(|limit| nodes % TIME_CHECK_INTERVAL == 0 && Instant::now() >= limit)
+fn search_timed_out(deadline: Option<SearchDeadline>, nodes: u64) -> bool {
+    deadline.is_some_and(|limit| nodes % TIME_CHECK_INTERVAL == 0 && deadline_reached(limit))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn deadline_after(duration: Duration) -> SearchDeadline {
+    Instant::now() + duration
 }
 
 #[cfg(target_arch = "wasm32")]
+fn deadline_after(duration: Duration) -> SearchDeadline {
+    js_sys::Date::now() + duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn deadline_reached(deadline: SearchDeadline) -> bool {
+    Instant::now() >= deadline
+}
+
+#[cfg(target_arch = "wasm32")]
+fn deadline_reached(deadline: SearchDeadline) -> bool {
+    js_sys::Date::now() >= deadline
+}
+
 fn piece_from_code(code: i32) -> Option<Piece> {
     match code {
         0 => Some(Piece::Empty),
@@ -973,7 +998,6 @@ fn piece_from_code(code: i32) -> Option<Piece> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn color_from_code(code: u8) -> Option<Color> {
     match code {
         0 => Some(Color::White),
@@ -982,9 +1006,7 @@ fn color_from_code(code: u8) -> Option<Color> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-pub fn search_best_move(board: Vec<i32>, side_to_move: u8, time_budget_ms: u32) -> i32 {
+pub fn search_best_move_for_board(board: &[i32], side_to_move: u8, time_budget_ms: u32) -> i32 {
     if board.len() != 64 {
         return -1;
     }
@@ -994,7 +1016,7 @@ pub fn search_best_move(board: Vec<i32>, side_to_move: u8, time_budget_ms: u32) 
     };
 
     let mut pieces = [Piece::Empty; 64];
-    for (idx, code) in board.into_iter().enumerate() {
+    for (idx, &code) in board.iter().enumerate() {
         let Some(piece) = piece_from_code(code) else {
             return -1;
         };

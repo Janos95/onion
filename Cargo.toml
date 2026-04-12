@@ -21,6 +21,7 @@ version = "0.3.60"
 features = [
     'Blob',
     'BlobPropertyBag',
+    'console',
     'Document',
     'Element',
     'HtmlElement',

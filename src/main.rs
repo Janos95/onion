@@ -63,6 +63,45 @@ fn write_gpu_board(queue: &wgpu::Queue, uniform_buf: &wgpu::Buffer, position: &P
     queue.write_buffer(uniform_buf, 0, gpu_board.as_byte_slice());
 }
 
+#[cfg(target_arch = "wasm32")]
+fn sync_debug_state(position: &Position, engine_is_thinking: bool, request_id: u32) {
+    let window = web_sys::window().expect("window should exist");
+    let debug_state = js_sys::Object::new();
+    let board = js_sys::Array::new();
+
+    for square in 0..64 {
+        board.push(&JsValue::from_f64(
+            position.piece_at(square as Square) as i32 as f64,
+        ));
+    }
+
+    js_sys::Reflect::set(&debug_state, &JsValue::from_str("board"), &board).unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("sideToMove"),
+        &JsValue::from_f64(position.side_to_move() as u8 as f64),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("engineThinking"),
+        &JsValue::from_bool(engine_is_thinking),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("requestId"),
+        &JsValue::from_f64(request_id as f64),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        window.as_ref(),
+        &JsValue::from_str("__onionDebug"),
+        &debug_state,
+    )
+    .unwrap();
+}
+
 #[derive(Debug, Copy, Clone)]
 enum AppEvent {
     EngineMoveReady {
@@ -105,6 +144,8 @@ struct EngineDriver {
     worker: web_sys::Worker,
     worker_url: String,
     _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _onerror: Closure<dyn FnMut(web_sys::Event)>,
+    _onmessageerror: Closure<dyn FnMut(web_sys::Event)>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -126,9 +167,14 @@ async function ensureInit() {{
 
 self.onmessage = async (event) => {{
   const [requestId, sideToMove, timeBudgetMs, board] = event.data;
-  await ensureInit();
-  const bestMove = search_best_move(board, sideToMove, timeBudgetMs);
-  self.postMessage([requestId, bestMove]);
+  try {{
+    await ensureInit();
+    const bestMove = search_best_move(Int32Array.from(board), sideToMove, timeBudgetMs);
+    self.postMessage([requestId, bestMove, null]);
+  }} catch (error) {{
+    console.error("engine worker error", error);
+    self.postMessage([requestId, -1, String(error)]);
+  }}
 }};
 "#
         );
@@ -154,6 +200,11 @@ self.onmessage = async (event) => {{
             let Some(request_id) = data.get(0).as_f64().map(|value| value as u32) else {
                 return;
             };
+            if let Some(error) = data.get(2).as_string() {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "engine worker failed: {error}"
+                )));
+            }
             let best_move = data.get(1).as_f64().and_then(|value| {
                 let value = value as i32;
                 (value >= 0).then_some(value as Move)
@@ -165,10 +216,28 @@ self.onmessage = async (event) => {{
         }) as Box<dyn FnMut(_)>);
         worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
+        let onerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "engine worker onerror: {:?}",
+                event.type_()
+            )));
+        }) as Box<dyn FnMut(_)>);
+        worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+        let onmessageerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "engine worker onmessageerror: {:?}",
+                event.type_()
+            )));
+        }) as Box<dyn FnMut(_)>);
+        worker.set_onmessageerror(Some(onmessageerror.as_ref().unchecked_ref()));
+
         EngineDriver {
             worker,
             worker_url,
             _onmessage: onmessage,
+            _onerror: onerror,
+            _onmessageerror: onmessageerror,
         }
     }
 
@@ -207,7 +276,7 @@ impl Drop for EngineDriver {
 fn worker_module_url() -> Result<String, JsValue> {
     let window = web_sys::window().expect("window should exist");
     let base = window.location().href()?;
-    Ok(web_sys::Url::new_with_base("onion.js", &base)?.href())
+    Ok(web_sys::Url::new_with_base("engine_worker.js", &base)?.href())
 }
 
 async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
@@ -322,6 +391,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let mut pending_drag_move = false;
     let mut engine_is_thinking = false;
     let mut active_request_id = 0u32;
+    #[cfg(target_arch = "wasm32")]
+    sync_debug_state(&position, engine_is_thinking, active_request_id);
 
     event_loop.run(move |event, _, control_flow| {
         let _ = (&instance, &adapter, &shader, &pipeline_layout);
@@ -342,6 +413,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                     write_gpu_board(&queue, &uniform_buf, &position);
                     window.request_redraw();
                 }
+                #[cfg(target_arch = "wasm32")]
+                sync_debug_state(&position, engine_is_thinking, active_request_id);
             }
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
@@ -378,6 +451,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
 
                                 engine_is_thinking = true;
                                 active_request_id = active_request_id.wrapping_add(1);
+                                #[cfg(target_arch = "wasm32")]
+                                sync_debug_state(&position, engine_is_thinking, active_request_id);
                                 engine_driver.request_move(active_request_id, position);
                             }
                         }
