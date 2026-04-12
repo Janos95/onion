@@ -2,9 +2,14 @@ alias v2 = vec2<f32>;
 alias v3 = vec3<f32>;
 alias v4 = vec4<f32>; 
 
+struct uniforms {
+    pieces: array<vec4<i32>, 16>,
+    status: vec4<f32>,
+};
+
 @group(0)
 @binding(0)
-var<uniform> pieces: array<vec4<i32>, 16>;
+var<uniform> state: uniforms;
 
 struct vertexoutput {
     @location(0) tex_coord: v2,
@@ -262,7 +267,7 @@ fn king(p : v2) -> f32
 }
 
 fn piece_color(square_id : i32) -> v3 {
-    let piece = pieces[square_id / 4][square_id % 4];
+    let piece = state.pieces[square_id / 4][square_id % 4];
     let is_even = (piece & 1) == 0;
     if is_even {
         // black
@@ -272,8 +277,16 @@ fn piece_color(square_id : i32) -> v3 {
     return pow(v3(248.,248.,248.) / 255., v3(2.2));
 }
 
+fn square_color(i : i32, j : i32) -> v3 {
+    let is_white = ((i + j) % 2) == 0;
+    if is_white {
+        return pow(v3(238.,238.,210.) / 255., v3(2.2));
+    }
+    return pow(v3(117.,150.,86.) / 255., v3(2.2));
+}
+
 fn dispatch_piece(p : v2, square_id : i32) -> f32 {
-    let piece = pieces[square_id / 4][square_id % 4];
+    let piece = state.pieces[square_id / 4][square_id % 4];
     if piece == 0 {
         return 1.;
     }
@@ -293,6 +306,8 @@ fn dispatch_piece(p : v2, square_id : i32) -> f32 {
 @fragment
 fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let uv = vertex.tex_coord;
+    let thinking = state.status.x;
+    let pulse_strength = 0.5 + 0.5 * cos(state.status.y * 4.19);
     let a = 1. / 8.;
     let x = uv.x / a;
     let y = uv.y / a;
@@ -309,19 +324,21 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
 
     let square_id = 8 * j + i;
     let d = dispatch_piece(p, square_id);
+    let piece = state.pieces[square_id / 4][square_id % 4];
+    let is_black_piece = piece != 0 && (piece & 1) == 0;
+    let square = square_color(i, j);
     var col : v3;
     if d < 0.0 {
         col = piece_color(square_id);
-    }
-    else {
-        let is_white = ((i + j) % 2) == 0;
-        if is_white {
-            col = pow(v3(238.,238.,210.) / 255., v3(2.2));
-        } 
-        else {
-            col = pow(v3(117.,150.,86.) / 255., v3(2.2));
+        if is_black_piece {
+            let piece_alpha = mix(1.0, 0.6 + 0.4 * pulse_strength, thinking);
+            col = mix(square, col, piece_alpha);
         }
     }
+    else {
+        col = square;
+    }
     col = mix(col, vec3(0.0), 1.0-smoothstep(0.0,0.03,abs(d)) );
+
     return v4(col.x, col.y, col.z, 1.);
 }

@@ -3,13 +3,15 @@
 /**
  * @param {Int32Array} board
  * @param {number} side_to_move
+ * @param {number} castling_rights
+ * @param {number} en_passant_square
  * @param {number} time_budget_ms
  * @returns {number}
  */
-export function search_best_move(board, side_to_move, time_budget_ms) {
+export function search_best_move(board, side_to_move, castling_rights, en_passant_square, time_budget_ms) {
     const ptr0 = passArray32ToWasm0(board, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.search_best_move(ptr0, len0, side_to_move, time_budget_ms);
+    const ret = wasm.search_best_move(ptr0, len0, side_to_move, castling_rights, en_passant_square, time_budget_ms);
     return ret;
 }
 function __wbg_get_imports() {

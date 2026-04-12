@@ -70,9 +70,10 @@ const INITIAL_PIECES: [Piece; 64] = [
     Piece::BlackRook,
 ];
 
-pub const SEARCH_TIME_BUDGET_MS: u32 = 2_000;
+pub const SEARCH_TIME_BUDGET_MS: u32 = 3_000;
 const CHECKMATE_SCORE: i32 = 100_000;
 const MAX_SEARCH_DEPTH: usize = 64;
+const MOVE_FLAG_SHIFT: u32 = 12;
 const FILE_MASKS: [Bitboard; 8] = [
     0x0101010101010101,
     0x0202020202020202,
@@ -100,6 +101,18 @@ const TT_BITS: usize = 18;
 const TT_SIZE: usize = 1 << TT_BITS;
 const TIME_CHECK_INTERVAL: u64 = 1 << 10;
 const ZOBRIST_SEED_INC: u64 = 0x9E37_79B9_7F4A_7C15;
+const WHITE_KINGSIDE_CASTLE: u8 = 1 << 0;
+const WHITE_QUEENSIDE_CASTLE: u8 = 1 << 1;
+const BLACK_KINGSIDE_CASTLE: u8 = 1 << 2;
+const BLACK_QUEENSIDE_CASTLE: u8 = 1 << 3;
+const ALL_CASTLING_RIGHTS: u8 =
+    WHITE_KINGSIDE_CASTLE | WHITE_QUEENSIDE_CASTLE | BLACK_KINGSIDE_CASTLE | BLACK_QUEENSIDE_CASTLE;
+const WHITE_KING_START: Square = 4;
+const WHITE_KINGSIDE_ROOK_START: Square = 7;
+const WHITE_QUEENSIDE_ROOK_START: Square = 0;
+const BLACK_KING_START: Square = 60;
+const BLACK_KINGSIDE_ROOK_START: Square = 63;
+const BLACK_QUEENSIDE_ROOK_START: Square = 56;
 
 #[cfg(not(target_arch = "wasm32"))]
 type SearchDeadline = Instant;
@@ -249,6 +262,8 @@ pub struct Position {
     colors: [Bitboard; 2],
     by_piece: [Piece; 64],
     side_to_move: Color,
+    castling_rights: u8,
+    en_passant_square: Option<Square>,
     hash: u64,
 }
 
@@ -263,6 +278,9 @@ struct Undo {
     moving_piece: Piece,
     placed_piece: Piece,
     captured_piece: Piece,
+    captured_square: Square,
+    previous_castling_rights: u8,
+    previous_en_passant_square: Option<Square>,
 }
 
 #[derive(Copy, Clone)]
@@ -319,6 +337,20 @@ enum SearchAborted {
     Timeout,
 }
 
+#[repr(u32)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum MoveFlag {
+    Quiet,
+    DoublePawnPush,
+    KingCastle,
+    QueenCastle,
+    EnPassant,
+    PromoteKnight,
+    PromoteBishop,
+    PromoteRook,
+    PromoteQueen,
+}
+
 const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -345,8 +377,38 @@ const fn generate_piece_hashes() -> [[u64; 64]; 13] {
     table
 }
 
+const fn generate_castling_hashes() -> [u64; 16] {
+    let mut table = [0; 16];
+    let mut idx = 0;
+    let mut seed: u64 = 0x0BAD_5EED_C0DE_CAFE;
+
+    while idx < 16 {
+        seed = seed.wrapping_add(ZOBRIST_SEED_INC);
+        table[idx] = mix64(seed);
+        idx += 1;
+    }
+
+    table
+}
+
+const fn generate_en_passant_hashes() -> [u64; 8] {
+    let mut table = [0; 8];
+    let mut idx = 0;
+    let mut seed: u64 = 0xFACE_FEED_1234_5678;
+
+    while idx < 8 {
+        seed = seed.wrapping_add(ZOBRIST_SEED_INC);
+        table[idx] = mix64(seed);
+        idx += 1;
+    }
+
+    table
+}
+
 const ZOBRIST_PIECES: [[u64; 64]; 13] = generate_piece_hashes();
 const ZOBRIST_SIDE_TO_MOVE: u64 = mix64(0xCAFEBABE_DEADBEEF);
+const ZOBRIST_CASTLING: [u64; 16] = generate_castling_hashes();
+const ZOBRIST_EN_PASSANT_FILE: [u64; 8] = generate_en_passant_hashes();
 
 fn piece_hash(piece: Piece, square: Square) -> u64 {
     ZOBRIST_PIECES[piece as usize][square as usize]
@@ -370,6 +432,38 @@ fn destination_square(m: Move) -> Square {
 
 fn origin_square(m: Move) -> Square {
     (m >> 6) & 0x3F
+}
+
+fn move_flag(m: Move) -> MoveFlag {
+    match (m >> MOVE_FLAG_SHIFT) & 0xF {
+        0 => MoveFlag::Quiet,
+        1 => MoveFlag::DoublePawnPush,
+        2 => MoveFlag::KingCastle,
+        3 => MoveFlag::QueenCastle,
+        4 => MoveFlag::EnPassant,
+        5 => MoveFlag::PromoteKnight,
+        6 => MoveFlag::PromoteBishop,
+        7 => MoveFlag::PromoteRook,
+        8 => MoveFlag::PromoteQueen,
+        _ => unreachable!("invalid move flag"),
+    }
+}
+
+fn promotion_kind(m: Move) -> Option<PieceKind> {
+    match move_flag(m) {
+        MoveFlag::PromoteKnight => Some(PieceKind::Knight),
+        MoveFlag::PromoteBishop => Some(PieceKind::Bishop),
+        MoveFlag::PromoteRook => Some(PieceKind::Rook),
+        MoveFlag::PromoteQueen => Some(PieceKind::Queen),
+        _ => None,
+    }
+}
+
+fn create_flagged_move(origin: Square, destination: Square, flag: MoveFlag) -> Move {
+    let mut m = destination;
+    m |= origin << 6;
+    m |= (flag as Move) << MOVE_FLAG_SHIFT;
+    m
 }
 
 fn set_square(bitboard: &mut Bitboard, square: Square) {
@@ -414,6 +508,20 @@ fn pawn_capture_directions(color: Color) -> [Direction; 2] {
     match color {
         Color::White => [Direction::NorthWest, Direction::NorthEast],
         Color::Black => [Direction::SouthWest, Direction::SouthEast],
+    }
+}
+
+fn kingside_castle_right(color: Color) -> u8 {
+    match color {
+        Color::White => WHITE_KINGSIDE_CASTLE,
+        Color::Black => BLACK_KINGSIDE_CASTLE,
+    }
+}
+
+fn queenside_castle_right(color: Color) -> u8 {
+    match color {
+        Color::White => WHITE_QUEENSIDE_CASTLE,
+        Color::Black => BLACK_QUEENSIDE_CASTLE,
     }
 }
 
@@ -468,15 +576,22 @@ fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[Direction]) -
 
 impl Position {
     pub fn new() -> Position {
-        Position::from_board(INITIAL_PIECES, Color::White)
+        Position::from_board_state(INITIAL_PIECES, Color::White, ALL_CASTLING_RIGHTS, None)
     }
 
-    fn from_board(by_piece: [Piece; 64], side_to_move: Color) -> Position {
+    fn from_board_state(
+        by_piece: [Piece; 64],
+        side_to_move: Color,
+        castling_rights: u8,
+        en_passant_square: Option<Square>,
+    ) -> Position {
         let mut position = Position {
             positions: [0; 7],
             colors: [0; 2],
             by_piece,
             side_to_move,
+            castling_rights,
+            en_passant_square,
             hash: 0,
         };
 
@@ -492,8 +607,108 @@ impl Position {
         if side_to_move == Color::Black {
             position.hash ^= ZOBRIST_SIDE_TO_MOVE;
         }
+        position.hash ^= ZOBRIST_CASTLING[castling_rights as usize];
+        if let Some(square) = en_passant_square {
+            position.hash ^= ZOBRIST_EN_PASSANT_FILE[(square % 8) as usize];
+        }
 
         position
+    }
+
+    pub fn from_fen(fen: &str) -> Result<Position, String> {
+        let mut fields = fen.split_whitespace();
+        let board_field = fields
+            .next()
+            .ok_or_else(|| "missing board in FEN".to_string())?;
+        let side_field = fields
+            .next()
+            .ok_or_else(|| "missing side to move in FEN".to_string())?;
+        let castling_field = fields
+            .next()
+            .ok_or_else(|| "missing castling rights in FEN".to_string())?;
+        let en_passant_field = fields
+            .next()
+            .ok_or_else(|| "missing en passant square in FEN".to_string())?;
+
+        let mut board = [Piece::Empty; 64];
+        let ranks: Vec<_> = board_field.split('/').collect();
+        if ranks.len() != 8 {
+            return Err("board must have 8 ranks".to_string());
+        }
+
+        for (fen_rank, rank_str) in ranks.iter().enumerate() {
+            let rank = 7 - fen_rank as u32;
+            let mut file = 0u32;
+
+            for ch in rank_str.chars() {
+                if let Some(empty) = ch.to_digit(10) {
+                    if empty == 0 || file + empty > 8 {
+                        return Err("invalid empty-square run in FEN".to_string());
+                    }
+                    file += empty;
+                    continue;
+                }
+
+                let piece = match ch {
+                    'P' => Piece::WhitePawn,
+                    'p' => Piece::BlackPawn,
+                    'N' => Piece::WhiteKnight,
+                    'n' => Piece::BlackKnight,
+                    'B' => Piece::WhiteBishop,
+                    'b' => Piece::BlackBishop,
+                    'R' => Piece::WhiteRook,
+                    'r' => Piece::BlackRook,
+                    'Q' => Piece::WhiteQueen,
+                    'q' => Piece::BlackQueen,
+                    'K' => Piece::WhiteKing,
+                    'k' => Piece::BlackKing,
+                    _ => return Err(format!("invalid piece in FEN: {ch}")),
+                };
+
+                if file >= 8 {
+                    return Err("rank is too wide in FEN".to_string());
+                }
+
+                board[(rank * 8 + file) as usize] = piece;
+                file += 1;
+            }
+
+            if file != 8 {
+                return Err("rank is too short in FEN".to_string());
+            }
+        }
+
+        let side_to_move = match side_field {
+            "w" => Color::White,
+            "b" => Color::Black,
+            _ => return Err("invalid side to move in FEN".to_string()),
+        };
+
+        let mut castling_rights = 0;
+        if castling_field != "-" {
+            for ch in castling_field.chars() {
+                castling_rights |= match ch {
+                    'K' => WHITE_KINGSIDE_CASTLE,
+                    'Q' => WHITE_QUEENSIDE_CASTLE,
+                    'k' => BLACK_KINGSIDE_CASTLE,
+                    'q' => BLACK_QUEENSIDE_CASTLE,
+                    _ => return Err(format!("invalid castling right in FEN: {ch}")),
+                };
+            }
+        }
+
+        let en_passant_square = if en_passant_field == "-" {
+            None
+        } else {
+            Some(parse_square_name(en_passant_field)?)
+        };
+
+        Ok(Position::from_board_state(
+            board,
+            side_to_move,
+            castling_rights,
+            en_passant_square,
+        ))
     }
 
     pub fn piece_at(&self, square: Square) -> Piece {
@@ -502,6 +717,14 @@ impl Position {
 
     pub fn side_to_move(&self) -> Color {
         self.side_to_move
+    }
+
+    pub fn castling_rights_bits(&self) -> u8 {
+        self.castling_rights
+    }
+
+    pub fn en_passant_square(&self) -> Option<Square> {
+        self.en_passant_square
     }
 
     fn occupied(&self) -> Bitboard {
@@ -519,6 +742,52 @@ impl Position {
         } else {
             Some(kings.trailing_zeros())
         }
+    }
+
+    fn set_castling_rights(&mut self, castling_rights: u8) {
+        self.hash ^= ZOBRIST_CASTLING[self.castling_rights as usize];
+        self.castling_rights = castling_rights;
+        self.hash ^= ZOBRIST_CASTLING[self.castling_rights as usize];
+    }
+
+    fn set_en_passant_square(&mut self, en_passant_square: Option<Square>) {
+        if let Some(square) = self.en_passant_square {
+            self.hash ^= ZOBRIST_EN_PASSANT_FILE[(square % 8) as usize];
+        }
+        self.en_passant_square = en_passant_square;
+        if let Some(square) = self.en_passant_square {
+            self.hash ^= ZOBRIST_EN_PASSANT_FILE[(square % 8) as usize];
+        }
+    }
+
+    fn update_castling_rights_after_move(
+        &mut self,
+        moving_piece: Piece,
+        origin: Square,
+        captured_piece: Piece,
+        captured_square: Square,
+    ) {
+        let mut castling_rights = self.castling_rights;
+
+        castling_rights &= match (moving_piece, origin) {
+            (Piece::WhiteKing, _) => !(WHITE_KINGSIDE_CASTLE | WHITE_QUEENSIDE_CASTLE),
+            (Piece::BlackKing, _) => !(BLACK_KINGSIDE_CASTLE | BLACK_QUEENSIDE_CASTLE),
+            (Piece::WhiteRook, WHITE_KINGSIDE_ROOK_START) => !WHITE_KINGSIDE_CASTLE,
+            (Piece::WhiteRook, WHITE_QUEENSIDE_ROOK_START) => !WHITE_QUEENSIDE_CASTLE,
+            (Piece::BlackRook, BLACK_KINGSIDE_ROOK_START) => !BLACK_KINGSIDE_CASTLE,
+            (Piece::BlackRook, BLACK_QUEENSIDE_ROOK_START) => !BLACK_QUEENSIDE_CASTLE,
+            _ => ALL_CASTLING_RIGHTS,
+        };
+
+        castling_rights &= match (captured_piece, captured_square) {
+            (Piece::WhiteRook, WHITE_KINGSIDE_ROOK_START) => !WHITE_KINGSIDE_CASTLE,
+            (Piece::WhiteRook, WHITE_QUEENSIDE_ROOK_START) => !WHITE_QUEENSIDE_CASTLE,
+            (Piece::BlackRook, BLACK_KINGSIDE_ROOK_START) => !BLACK_KINGSIDE_CASTLE,
+            (Piece::BlackRook, BLACK_QUEENSIDE_ROOK_START) => !BLACK_QUEENSIDE_CASTLE,
+            _ => ALL_CASTLING_RIGHTS,
+        };
+
+        self.set_castling_rights(castling_rights);
     }
 
     fn remove_piece(&mut self, square: Square, piece: Piece) {
@@ -544,22 +813,75 @@ impl Position {
     fn make_move_unchecked(&mut self, m: Move) -> Undo {
         let origin = origin_square(m);
         let destination = destination_square(m);
+        let flag = move_flag(m);
         let moving_piece = self.by_piece[origin as usize];
-        let captured_piece = self.by_piece[destination as usize];
-        let destination_rank = destination / 8;
-        let placed_piece = if moving_piece.kind() == PieceKind::Pawn
-            && (destination_rank == 0 || destination_rank == 7)
-        {
-            Piece::from_kind_color(PieceKind::Queen, self.side_to_move)
+        let captured_square = if flag == MoveFlag::EnPassant {
+            match self.side_to_move {
+                Color::White => destination - 8,
+                Color::Black => destination + 8,
+            }
         } else {
-            moving_piece
+            destination
         };
+        let captured_piece = self.by_piece[captured_square as usize];
+        let placed_piece = promotion_kind(m)
+            .map(|kind| Piece::from_kind_color(kind, self.side_to_move))
+            .unwrap_or_else(|| {
+                let destination_rank = destination / 8;
+                if moving_piece.kind() == PieceKind::Pawn
+                    && (destination_rank == 0 || destination_rank == 7)
+                {
+                    Piece::from_kind_color(PieceKind::Queen, self.side_to_move)
+                } else {
+                    moving_piece
+                }
+            });
+        let previous_castling_rights = self.castling_rights;
+        let previous_en_passant_square = self.en_passant_square;
+
+        self.set_en_passant_square(None);
 
         self.remove_piece(origin, moving_piece);
         if captured_piece != Piece::Empty {
-            self.remove_piece(destination, captured_piece);
+            self.remove_piece(captured_square, captured_piece);
         }
         self.add_piece(destination, placed_piece);
+
+        match flag {
+            MoveFlag::KingCastle => {
+                let (rook_from, rook_to) = match self.side_to_move {
+                    Color::White => (WHITE_KINGSIDE_ROOK_START, 5),
+                    Color::Black => (BLACK_KINGSIDE_ROOK_START, 61),
+                };
+                let rook = self.by_piece[rook_from as usize];
+                self.remove_piece(rook_from, rook);
+                self.add_piece(rook_to, rook);
+            }
+            MoveFlag::QueenCastle => {
+                let (rook_from, rook_to) = match self.side_to_move {
+                    Color::White => (WHITE_QUEENSIDE_ROOK_START, 3),
+                    Color::Black => (BLACK_QUEENSIDE_ROOK_START, 59),
+                };
+                let rook = self.by_piece[rook_from as usize];
+                self.remove_piece(rook_from, rook);
+                self.add_piece(rook_to, rook);
+            }
+            MoveFlag::DoublePawnPush => {
+                let en_passant_square = match self.side_to_move {
+                    Color::White => origin + 8,
+                    Color::Black => origin - 8,
+                };
+                self.set_en_passant_square(Some(en_passant_square));
+            }
+            _ => {}
+        }
+
+        self.update_castling_rights_after_move(
+            moving_piece,
+            origin,
+            captured_piece,
+            captured_square,
+        );
 
         self.side_to_move = self.side_to_move.opposite();
         self.hash ^= ZOBRIST_SIDE_TO_MOVE;
@@ -568,20 +890,48 @@ impl Position {
             moving_piece,
             placed_piece,
             captured_piece,
+            captured_square,
+            previous_castling_rights,
+            previous_en_passant_square,
         }
     }
 
     fn undo_move_unchecked(&mut self, m: Move, undo: Undo) {
         let origin = origin_square(m);
         let destination = destination_square(m);
+        let flag = move_flag(m);
 
         self.side_to_move = self.side_to_move.opposite();
         self.hash ^= ZOBRIST_SIDE_TO_MOVE;
 
+        self.set_en_passant_square(undo.previous_en_passant_square);
+        self.set_castling_rights(undo.previous_castling_rights);
+
         self.remove_piece(destination, undo.placed_piece);
+        match flag {
+            MoveFlag::KingCastle => {
+                let (rook_from, rook_to) = match self.side_to_move {
+                    Color::White => (5, WHITE_KINGSIDE_ROOK_START),
+                    Color::Black => (61, BLACK_KINGSIDE_ROOK_START),
+                };
+                let rook = self.by_piece[rook_from as usize];
+                self.remove_piece(rook_from, rook);
+                self.add_piece(rook_to, rook);
+            }
+            MoveFlag::QueenCastle => {
+                let (rook_from, rook_to) = match self.side_to_move {
+                    Color::White => (3, WHITE_QUEENSIDE_ROOK_START),
+                    Color::Black => (59, BLACK_QUEENSIDE_ROOK_START),
+                };
+                let rook = self.by_piece[rook_from as usize];
+                self.remove_piece(rook_from, rook);
+                self.add_piece(rook_to, rook);
+            }
+            _ => {}
+        }
         self.add_piece(origin, undo.moving_piece);
         if undo.captured_piece != Piece::Empty {
-            self.add_piece(destination, undo.captured_piece);
+            self.add_piece(undo.captured_square, undo.captured_piece);
         }
     }
 
@@ -649,6 +999,12 @@ impl Position {
     fn in_check(&self, color: Color) -> bool {
         self.king_square(color)
             .is_some_and(|square| is_square_attacked(self, square, color.opposite()))
+    }
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -932,13 +1288,7 @@ impl Default for Searcher {
 }
 
 pub fn create_move(origin: Square, destination: Square) -> Move {
-    let mut m = destination;
-    m |= origin << 6;
-    m
-}
-
-pub fn make_move(position: &mut Position) -> bool {
-    Searcher::new().make_move(position)
+    create_flagged_move(origin, destination, MoveFlag::Quiet)
 }
 
 pub fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
@@ -951,12 +1301,33 @@ pub fn try_player_move(position: &mut Position, origin: Square, destination: Squ
     }
 }
 
-pub fn search_root_with_stats(position: &Position, depth: usize) -> Option<SearchStats> {
-    Searcher::new().search_root_with_stats(position, depth)
+pub fn perft(position: &Position, depth: usize) -> u64 {
+    let mut scratch = *position;
+    perft_mut(&mut scratch, depth)
+}
+
+fn perft_mut(position: &mut Position, depth: usize) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = generate_legal_moves(position);
+    if depth == 1 {
+        return moves.num_moves as u64;
+    }
+
+    let mut nodes = 0;
+    for m in moves.iter() {
+        let undo = position.make_move_unchecked(m);
+        nodes += perft_mut(position, depth - 1);
+        position.undo_move_unchecked(m, undo);
+    }
+    nodes
 }
 
 fn search_timed_out(deadline: Option<SearchDeadline>, nodes: u64) -> bool {
-    deadline.is_some_and(|limit| nodes % TIME_CHECK_INTERVAL == 0 && deadline_reached(limit))
+    deadline
+        .is_some_and(|limit| nodes.is_multiple_of(TIME_CHECK_INTERVAL) && deadline_reached(limit))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1006,13 +1377,45 @@ fn color_from_code(code: u8) -> Option<Color> {
     }
 }
 
-pub fn search_best_move_for_board(board: &[i32], side_to_move: u8, time_budget_ms: u32) -> i32 {
+fn parse_square_name(square: &str) -> Result<Square, String> {
+    let bytes = square.as_bytes();
+    if bytes.len() != 2 {
+        return Err(format!("invalid square: {square}"));
+    }
+
+    let file = match bytes[0] {
+        b'a'..=b'h' => bytes[0] - b'a',
+        _ => return Err(format!("invalid square file: {square}")),
+    };
+    let rank = match bytes[1] {
+        b'1'..=b'8' => bytes[1] - b'1',
+        _ => return Err(format!("invalid square rank: {square}")),
+    };
+
+    Ok((rank as u32) * 8 + file as u32)
+}
+
+pub fn search_best_move(
+    board: &[i32],
+    side_to_move: u8,
+    castling_rights: u8,
+    en_passant_square: i32,
+    time_budget_ms: u32,
+) -> i32 {
     if board.len() != 64 {
         return -1;
     }
 
     let Some(side_to_move) = color_from_code(side_to_move) else {
         return -1;
+    };
+    if castling_rights & !ALL_CASTLING_RIGHTS != 0 {
+        return -1;
+    }
+    let en_passant_square = match en_passant_square {
+        -1 => None,
+        0..=63 => Some(en_passant_square as Square),
+        _ => return -1,
     };
 
     let mut pieces = [Piece::Empty; 64];
@@ -1023,7 +1426,8 @@ pub fn search_best_move_for_board(board: &[i32], side_to_move: u8, time_budget_m
         pieces[idx] = piece;
     }
 
-    let position = Position::from_board(pieces, side_to_move);
+    let position =
+        Position::from_board_state(pieces, side_to_move, castling_rights, en_passant_square);
     let mut searcher = Searcher::new();
     searcher
         .best_move_with_time_budget(&position, Duration::from_millis(time_budget_ms as u64))
@@ -1060,6 +1464,29 @@ fn generate_piece_moves(position: &Position, moves: &mut Moves, piece_kind: Piec
     }
 }
 
+fn push_promotion_moves(moves: &mut Moves, origin: Square, destination: Square) {
+    moves.push(create_flagged_move(
+        origin,
+        destination,
+        MoveFlag::PromoteQueen,
+    ));
+    moves.push(create_flagged_move(
+        origin,
+        destination,
+        MoveFlag::PromoteKnight,
+    ));
+    moves.push(create_flagged_move(
+        origin,
+        destination,
+        MoveFlag::PromoteRook,
+    ));
+    moves.push(create_flagged_move(
+        origin,
+        destination,
+        MoveFlag::PromoteBishop,
+    ));
+}
+
 fn generate_pawn_moves(position: &Position, moves: &mut Moves) {
     let us = position.side_to_move;
     let them = us.opposite();
@@ -1070,12 +1497,20 @@ fn generate_pawn_moves(position: &Position, moves: &mut Moves) {
     let enemy_king = position.pieces(them, PieceKind::King);
     let enemy_pieces = position.colors[them as usize] & !enemy_king;
     let direction_offset = |dir: Direction| dir as i32;
+    let promotion_rank = match us {
+        Color::White => 7,
+        Color::Black => 0,
+    };
 
     let mut single_pushes = shift(pawns, up) & empty;
     while single_pushes != 0 {
         let destination = pop_square(&mut single_pushes);
         let origin = (destination as i32 - direction_offset(up)) as Square;
-        moves.push(create_move(origin, destination));
+        if destination / 8 == promotion_rank {
+            push_promotion_moves(moves, origin, destination);
+        } else {
+            moves.push(create_move(origin, destination));
+        }
     }
 
     let mut double_pushes = shift(
@@ -1085,21 +1520,145 @@ fn generate_pawn_moves(position: &Position, moves: &mut Moves) {
     while double_pushes != 0 {
         let destination = pop_square(&mut double_pushes);
         let origin = (destination as i32 - 2 * direction_offset(up)) as Square;
-        moves.push(create_move(origin, destination));
+        moves.push(create_flagged_move(
+            origin,
+            destination,
+            MoveFlag::DoublePawnPush,
+        ));
     }
 
     let mut left_captures = shift(pawns, up_left) & enemy_pieces;
     while left_captures != 0 {
         let destination = pop_square(&mut left_captures);
         let origin = (destination as i32 - direction_offset(up_left)) as Square;
-        moves.push(create_move(origin, destination));
+        if destination / 8 == promotion_rank {
+            push_promotion_moves(moves, origin, destination);
+        } else {
+            moves.push(create_move(origin, destination));
+        }
     }
 
     let mut right_captures = shift(pawns, up_right) & enemy_pieces;
     while right_captures != 0 {
         let destination = pop_square(&mut right_captures);
         let origin = (destination as i32 - direction_offset(up_right)) as Square;
-        moves.push(create_move(origin, destination));
+        if destination / 8 == promotion_rank {
+            push_promotion_moves(moves, origin, destination);
+        } else {
+            moves.push(create_move(origin, destination));
+        }
+    }
+
+    if let Some(en_passant_square) = position.en_passant_square {
+        let target = to_bb(en_passant_square);
+
+        let mut left_en_passant = shift(pawns, up_left) & target;
+        while left_en_passant != 0 {
+            let destination = pop_square(&mut left_en_passant);
+            let origin = (destination as i32 - direction_offset(up_left)) as Square;
+            moves.push(create_flagged_move(
+                origin,
+                destination,
+                MoveFlag::EnPassant,
+            ));
+        }
+
+        let mut right_en_passant = shift(pawns, up_right) & target;
+        while right_en_passant != 0 {
+            let destination = pop_square(&mut right_en_passant);
+            let origin = (destination as i32 - direction_offset(up_right)) as Square;
+            moves.push(create_flagged_move(
+                origin,
+                destination,
+                MoveFlag::EnPassant,
+            ));
+        }
+    }
+}
+
+fn generate_king_moves(position: &Position, moves: &mut Moves) {
+    let us = position.side_to_move;
+    let own_pieces = position.colors[us as usize];
+    let enemy_king = position.pieces(us.opposite(), PieceKind::King);
+    let Some(from) = position.king_square(us) else {
+        return;
+    };
+
+    let mut targets = king_attacks(from) & !own_pieces & !enemy_king;
+    while targets != 0 {
+        moves.push(create_move(from, pop_square(&mut targets)));
+    }
+
+    if position.in_check(us) {
+        return;
+    }
+
+    let them = us.opposite();
+    match us {
+        Color::White => {
+            if position.castling_rights & kingside_castle_right(us) != 0
+                && position.piece_at(WHITE_KING_START) == Piece::WhiteKing
+                && position.piece_at(WHITE_KINGSIDE_ROOK_START) == Piece::WhiteRook
+                && position.piece_at(5) == Piece::Empty
+                && position.piece_at(6) == Piece::Empty
+                && !is_square_attacked(position, 5, them)
+                && !is_square_attacked(position, 6, them)
+            {
+                moves.push(create_flagged_move(
+                    WHITE_KING_START,
+                    6,
+                    MoveFlag::KingCastle,
+                ));
+            }
+
+            if position.castling_rights & queenside_castle_right(us) != 0
+                && position.piece_at(WHITE_KING_START) == Piece::WhiteKing
+                && position.piece_at(WHITE_QUEENSIDE_ROOK_START) == Piece::WhiteRook
+                && position.piece_at(1) == Piece::Empty
+                && position.piece_at(2) == Piece::Empty
+                && position.piece_at(3) == Piece::Empty
+                && !is_square_attacked(position, 3, them)
+                && !is_square_attacked(position, 2, them)
+            {
+                moves.push(create_flagged_move(
+                    WHITE_KING_START,
+                    2,
+                    MoveFlag::QueenCastle,
+                ));
+            }
+        }
+        Color::Black => {
+            if position.castling_rights & kingside_castle_right(us) != 0
+                && position.piece_at(BLACK_KING_START) == Piece::BlackKing
+                && position.piece_at(BLACK_KINGSIDE_ROOK_START) == Piece::BlackRook
+                && position.piece_at(61) == Piece::Empty
+                && position.piece_at(62) == Piece::Empty
+                && !is_square_attacked(position, 61, them)
+                && !is_square_attacked(position, 62, them)
+            {
+                moves.push(create_flagged_move(
+                    BLACK_KING_START,
+                    62,
+                    MoveFlag::KingCastle,
+                ));
+            }
+
+            if position.castling_rights & queenside_castle_right(us) != 0
+                && position.piece_at(BLACK_KING_START) == Piece::BlackKing
+                && position.piece_at(BLACK_QUEENSIDE_ROOK_START) == Piece::BlackRook
+                && position.piece_at(57) == Piece::Empty
+                && position.piece_at(58) == Piece::Empty
+                && position.piece_at(59) == Piece::Empty
+                && !is_square_attacked(position, 59, them)
+                && !is_square_attacked(position, 58, them)
+            {
+                moves.push(create_flagged_move(
+                    BLACK_KING_START,
+                    58,
+                    MoveFlag::QueenCastle,
+                ));
+            }
+        }
     }
 }
 
@@ -1109,7 +1668,7 @@ fn generate_pseudo_legal_moves(position: &Position) -> Moves {
     generate_piece_moves(position, &mut moves, PieceKind::Bishop);
     generate_piece_moves(position, &mut moves, PieceKind::Rook);
     generate_piece_moves(position, &mut moves, PieceKind::Queen);
-    generate_piece_moves(position, &mut moves, PieceKind::King);
+    generate_king_moves(position, &mut moves);
     generate_pawn_moves(position, &mut moves);
     moves
 }
@@ -1193,25 +1752,28 @@ fn move_score(position: &Position, m: Move, tt_move: Option<Move>) -> i32 {
     }
 
     let origin = origin_square(m);
-    let destination = destination_square(m);
     let moving_piece = position.by_piece[origin as usize];
-    let captured_piece = position.by_piece[destination as usize];
+    let captured_piece = if move_flag(m) == MoveFlag::EnPassant {
+        Piece::from_kind_color(PieceKind::Pawn, position.side_to_move.opposite())
+    } else {
+        position.by_piece[destination_square(m) as usize]
+    };
 
     let mut score = 0;
     if captured_piece != Piece::Empty {
         score += 10_000;
         score += piece_value(captured_piece.kind()) * 16 - piece_value(moving_piece.kind());
     }
-    if moving_piece.kind() == PieceKind::Pawn && (destination / 8 == 0 || destination / 8 == 7) {
-        score += 8_000;
+    if let Some(kind) = promotion_kind(m) {
+        score += 8_000 + piece_value(kind);
     }
     score
 }
 
 fn order_moves(position: &Position, moves: &mut Moves, tt_move: Option<Move>) {
     let mut scores = [0; 256];
-    for idx in 0..moves.num_moves {
-        scores[idx] = move_score(position, moves.moves[idx], tt_move);
+    for (idx, score) in scores.iter_mut().enumerate().take(moves.num_moves) {
+        *score = move_score(position, moves.moves[idx], tt_move);
     }
 
     for i in 1..moves.num_moves {
@@ -1239,7 +1801,11 @@ mod tests {
         for &(square, piece) in pieces {
             board[square as usize] = piece;
         }
-        Position::from_board(board, side_to_move)
+        Position::from_board_state(board, side_to_move, 0, None)
+    }
+
+    fn position_from_fen(fen: &str) -> Position {
+        Position::from_fen(fen).unwrap()
     }
 
     #[test]
@@ -1322,5 +1888,65 @@ mod tests {
             assert_eq!(position.piece_at(square), original.piece_at(square));
         }
         assert_eq!(position.side_to_move(), original.side_to_move());
+        assert_eq!(
+            position.castling_rights_bits(),
+            original.castling_rights_bits()
+        );
+        assert_eq!(position.en_passant_square(), original.en_passant_square());
+    }
+
+    #[test]
+    fn castling_moves_are_generated_when_legal() {
+        let mut position = position_from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        let legal_moves = generate_legal_moves(&mut position);
+
+        assert!(legal_moves.find(4, 6).is_some());
+        assert!(legal_moves.find(4, 2).is_some());
+    }
+
+    #[test]
+    fn en_passant_capture_is_legal() {
+        let mut position = position_from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1");
+        let en_passant = generate_legal_moves(&mut position)
+            .find(36, 43)
+            .expect("en passant should be legal");
+
+        position.do_move(en_passant);
+
+        assert_eq!(position.piece_at(43), Piece::WhitePawn);
+        assert_eq!(position.piece_at(35), Piece::Empty);
+        assert_eq!(position.piece_at(36), Piece::Empty);
+    }
+
+    #[test]
+    fn promotions_generate_all_four_choices() {
+        let mut position = position_from_fen("7k/P7/8/8/8/8/8/4K3 w - - 0 1");
+        let promotion_count = generate_legal_moves(&mut position)
+            .iter()
+            .filter(|m| origin_square(*m) == 48 && destination_square(*m) == 56)
+            .count();
+
+        assert_eq!(promotion_count, 4);
+    }
+
+    #[test]
+    fn perft_matches_initial_position_counts() {
+        let position = Position::new();
+
+        assert_eq!(perft(&position, 1), 20);
+        assert_eq!(perft(&position, 2), 400);
+        assert_eq!(perft(&position, 3), 8_902);
+        assert_eq!(perft(&position, 4), 197_281);
+    }
+
+    #[test]
+    fn perft_matches_mixed_special_move_position() {
+        let position = position_from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPB1PPP/R3K2R w KQkq - 0 1",
+        );
+
+        assert_eq!(perft(&position, 1), 43);
+        assert_eq!(perft(&position, 2), 1_872);
+        assert_eq!(perft(&position, 3), 81_324);
     }
 }

@@ -13,7 +13,14 @@ use winit::{
 
 #[cfg(not(target_arch = "wasm32"))]
 use onion::engine::Searcher;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
+#[cfg(target_arch = "wasm32")]
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 
@@ -37,16 +44,25 @@ fn mouse_to_square(
 
 #[repr(C, align(16))]
 #[derive(Debug, Copy, Clone)]
-struct GpuBoard {
+struct GpuState {
     pieces: [i32; 64],
+    status: [f32; 4],
 }
 
-unsafe impl Zeroable for GpuBoard {}
-unsafe impl Pod for GpuBoard {}
+unsafe impl Zeroable for GpuState {}
+unsafe impl Pod for GpuState {}
 
-impl GpuBoard {
-    fn new(position: &Position) -> GpuBoard {
-        let mut board = GpuBoard { pieces: [0; 64] };
+impl GpuState {
+    fn new(position: &Position, engine_is_thinking: bool, animation_time_seconds: f32) -> GpuState {
+        let mut board = GpuState {
+            pieces: [0; 64],
+            status: [
+                if engine_is_thinking { 1.0 } else { 0.0 },
+                animation_time_seconds,
+                0.0,
+                0.0,
+            ],
+        };
         for square in 0..64 {
             board.pieces[square] = position.piece_at(square as Square) as i32;
         }
@@ -58,9 +74,25 @@ impl GpuBoard {
     }
 }
 
-fn write_gpu_board(queue: &wgpu::Queue, uniform_buf: &wgpu::Buffer, position: &Position) {
-    let gpu_board = GpuBoard::new(position);
-    queue.write_buffer(uniform_buf, 0, gpu_board.as_byte_slice());
+#[cfg(not(target_arch = "wasm32"))]
+fn animation_time_seconds(start_time: Instant) -> f32 {
+    start_time.elapsed().as_secs_f32()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn animation_time_seconds(start_time_ms: f64) -> f32 {
+    ((js_sys::Date::now() - start_time_ms) / 1000.0) as f32
+}
+
+fn write_gpu_state(
+    queue: &wgpu::Queue,
+    uniform_buf: &wgpu::Buffer,
+    position: &Position,
+    engine_is_thinking: bool,
+    animation_time_seconds: f32,
+) {
+    let gpu_state = GpuState::new(position, engine_is_thinking, animation_time_seconds);
+    queue.write_buffer(uniform_buf, 0, gpu_state.as_byte_slice());
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -80,6 +112,22 @@ fn sync_debug_state(position: &Position, engine_is_thinking: bool, request_id: u
         &debug_state,
         &JsValue::from_str("sideToMove"),
         &JsValue::from_f64(position.side_to_move() as u8 as f64),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("castlingRights"),
+        &JsValue::from_f64(position.castling_rights_bits() as f64),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("enPassantSquare"),
+        &JsValue::from_f64(
+            position
+                .en_passant_square()
+                .map_or(-1.0, |square| square as f64),
+        ),
     )
     .unwrap();
     js_sys::Reflect::set(
@@ -104,10 +152,57 @@ fn sync_debug_state(position: &Position, engine_is_thinking: bool, request_id: u
 
 #[derive(Debug, Copy, Clone)]
 enum AppEvent {
+    #[cfg(target_arch = "wasm32")]
+    AnimationTick,
     EngineMoveReady {
         request_id: u32,
         best_move: Option<Move>,
     },
+}
+
+#[cfg(target_arch = "wasm32")]
+struct AnimationLoop {
+    active: Rc<Cell<bool>>,
+    callback: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl AnimationLoop {
+    fn new(proxy: EventLoopProxy<AppEvent>) -> AnimationLoop {
+        let active = Rc::new(Cell::new(false));
+        let callback = Rc::new(RefCell::new(None::<Closure<dyn FnMut(f64)>>));
+        let active_for_loop = Rc::clone(&active);
+        let callback_for_loop = Rc::clone(&callback);
+
+        *callback.borrow_mut() = Some(Closure::wrap(Box::new(move |_timestamp: f64| {
+            let _ = proxy.send_event(AppEvent::AnimationTick);
+            if active_for_loop.get() {
+                if let Some(window) = web_sys::window() {
+                    if let Some(callback) = callback_for_loop.borrow().as_ref() {
+                        let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(f64)>));
+
+        AnimationLoop { active, callback }
+    }
+
+    fn start(&self) {
+        if self.active.replace(true) {
+            return;
+        }
+
+        if let Some(window) = web_sys::window() {
+            if let Some(callback) = self.callback.borrow().as_ref() {
+                let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.active.set(false);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -166,10 +261,16 @@ async function ensureInit() {{
 }}
 
 self.onmessage = async (event) => {{
-  const [requestId, sideToMove, timeBudgetMs, board] = event.data;
+  const [requestId, sideToMove, castlingRights, enPassantSquare, timeBudgetMs, board] = event.data;
   try {{
     await ensureInit();
-    const bestMove = search_best_move(Int32Array.from(board), sideToMove, timeBudgetMs);
+    const bestMove = search_best_move(
+      Int32Array.from(board),
+      sideToMove,
+      castlingRights,
+      enPassantSquare,
+      timeBudgetMs,
+    );
     self.postMessage([requestId, bestMove, null]);
   }} catch (error) {{
     console.error("engine worker error", error);
@@ -252,6 +353,12 @@ self.onmessage = async (event) => {{
         let payload = js_sys::Array::new();
         payload.push(&JsValue::from_f64(request_id as f64));
         payload.push(&JsValue::from_f64(position.side_to_move() as u8 as f64));
+        payload.push(&JsValue::from_f64(position.castling_rights_bits() as f64));
+        payload.push(&JsValue::from_f64(
+            position
+                .en_passant_square()
+                .map_or(-1.0, |square| square as f64),
+        ));
         payload.push(&JsValue::from_f64(SEARCH_TIME_BUDGET_MS as f64));
         let board_js: JsValue = board.into();
         payload.push(&board_js);
@@ -311,13 +418,18 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
     });
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let animation_start = Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let animation_start = js_sys::Date::now();
+
     let engine_driver = EngineDriver::new(event_loop.create_proxy());
     let mut position = Position::new();
-    let gpu_board = GpuBoard::new(&position);
+    let gpu_state = GpuState::new(&position, false, 0.0);
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Uniform Buffer"),
-        contents: gpu_board.as_byte_slice(),
+        contents: gpu_state.as_byte_slice(),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -329,7 +441,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
-                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<GpuBoard>() as u64),
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<GpuState>() as u64),
             },
             count: None,
         }],
@@ -385,20 +497,67 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     surface.configure(&device, &config);
     window.request_redraw();
 
+    #[cfg(target_arch = "wasm32")]
+    let animation_loop = AnimationLoop::new(event_loop.create_proxy());
+
     let mut current_mouse_pos = None;
     let mut mouse_index = 0;
     let mut mouse_positions = [PhysicalPosition::default(); 2];
-    let mut pending_drag_move = false;
+    let mut pending_move_selection = false;
     let mut engine_is_thinking = false;
+    let mut thinking_started_time_seconds = 0.0f32;
     let mut active_request_id = 0u32;
     #[cfg(target_arch = "wasm32")]
     sync_debug_state(&position, engine_is_thinking, active_request_id);
 
     event_loop.run(move |event, _, control_flow| {
         let _ = (&instance, &adapter, &shader, &pipeline_layout);
+        #[cfg(target_arch = "wasm32")]
+        let _ = &animation_loop;
 
-        *control_flow = ControlFlow::Wait;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *control_flow = if engine_is_thinking {
+                ControlFlow::Poll
+            } else {
+                ControlFlow::Wait
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            *control_flow = ControlFlow::Wait;
+        }
         match event {
+            #[cfg(target_arch = "wasm32")]
+            Event::UserEvent(AppEvent::AnimationTick) => {
+                if engine_is_thinking {
+                    let thinking_elapsed =
+                        animation_time_seconds(animation_start) - thinking_started_time_seconds;
+                    write_gpu_state(
+                        &queue,
+                        &uniform_buf,
+                        &position,
+                        engine_is_thinking,
+                        thinking_elapsed,
+                    );
+                    window.request_redraw();
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Event::MainEventsCleared => {
+                if engine_is_thinking {
+                    let thinking_elapsed =
+                        animation_time_seconds(animation_start) - thinking_started_time_seconds;
+                    write_gpu_state(
+                        &queue,
+                        &uniform_buf,
+                        &position,
+                        engine_is_thinking,
+                        thinking_elapsed,
+                    );
+                    window.request_redraw();
+                }
+            }
             Event::UserEvent(AppEvent::EngineMoveReady {
                 request_id,
                 best_move,
@@ -408,11 +567,19 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 }
 
                 engine_is_thinking = false;
+                #[cfg(target_arch = "wasm32")]
+                animation_loop.stop();
                 if let Some(best_move) = best_move {
                     position.do_move(best_move);
-                    write_gpu_board(&queue, &uniform_buf, &position);
-                    window.request_redraw();
                 }
+                write_gpu_state(
+                    &queue,
+                    &uniform_buf,
+                    &position,
+                    engine_is_thinking,
+                    0.0,
+                );
+                window.request_redraw();
                 #[cfg(target_arch = "wasm32")]
                 sync_debug_state(&position, engine_is_thinking, active_request_id);
             }
@@ -433,24 +600,34 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                     if state == winit::event::ElementState::Released {
                         if let Some(mouse_pos) = current_mouse_pos {
                             mouse_positions[mouse_index] = mouse_pos;
-                            pending_drag_move = mouse_index == 1;
+                            pending_move_selection = mouse_index == 1;
                             mouse_index = (mouse_index + 1) % 2;
                         }
                     }
 
-                    if pending_drag_move {
-                        pending_drag_move = false;
+                    if pending_move_selection {
+                        pending_move_selection = false;
                         let window_size = window.inner_size();
                         if let (Some(from), Some(to)) = (
                             mouse_to_square(mouse_positions[0], window_size),
                             mouse_to_square(mouse_positions[1], window_size),
                         ) {
                             if try_player_move(&mut position, from, to) {
-                                write_gpu_board(&queue, &uniform_buf, &position);
-                                window.request_redraw();
-
                                 engine_is_thinking = true;
+                                // Reset the pulse phase so black pieces always start fully opaque.
+                                thinking_started_time_seconds =
+                                    animation_time_seconds(animation_start);
                                 active_request_id = active_request_id.wrapping_add(1);
+                                #[cfg(target_arch = "wasm32")]
+                                animation_loop.start();
+                                write_gpu_state(
+                                    &queue,
+                                    &uniform_buf,
+                                    &position,
+                                    engine_is_thinking,
+                                    0.0,
+                                );
+                                window.request_redraw();
                                 #[cfg(target_arch = "wasm32")]
                                 sync_debug_state(&position, engine_is_thinking, active_request_id);
                                 engine_driver.request_move(active_request_id, position);
