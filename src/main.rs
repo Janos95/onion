@@ -1,51 +1,108 @@
-use std::{borrow::Cow, cmp::max, cmp::min, iter::Iterator};
-use winit::{
-    event::{Event, WindowEvent, MouseButton},
-    event_loop::{ControlFlow, EventLoop},
-    window::Window, dpi::PhysicalPosition,
-};
-use wgpu::util::DeviceExt;
 use bytemuck::{Pod, Zeroable};
+use std::borrow::Cow;
+use wgpu::util::DeviceExt;
+use winit::{
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{Event, MouseButton, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::Window,
+};
 
 const INITIAL_PIECES: [Piece; 64] = [
-    Piece::WhiteRook, Piece::WhiteKnight, Piece::WhiteBishop, Piece::WhiteQueen, Piece::WhiteKing, Piece::WhiteBishop, Piece::WhiteKnight, Piece::WhiteRook, 
-    Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn, Piece::WhitePawn,
-    Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty,
-    Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty,
-    Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty,
-    Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty, Piece::Empty,
-    Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn, Piece::BlackPawn,
-    Piece::BlackRook, Piece::BlackKnight, Piece::BlackBishop, Piece::BlackQueen, Piece::BlackKing, Piece::BlackBishop, Piece::BlackKnight, Piece::BlackRook,
+    Piece::WhiteRook,
+    Piece::WhiteKnight,
+    Piece::WhiteBishop,
+    Piece::WhiteQueen,
+    Piece::WhiteKing,
+    Piece::WhiteBishop,
+    Piece::WhiteKnight,
+    Piece::WhiteRook,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::WhitePawn,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::Empty,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackPawn,
+    Piece::BlackRook,
+    Piece::BlackKnight,
+    Piece::BlackBishop,
+    Piece::BlackQueen,
+    Piece::BlackKing,
+    Piece::BlackBishop,
+    Piece::BlackKnight,
+    Piece::BlackRook,
 ];
 
-const FILE_MASKS: [u64; 8] = [
-    0x0101010101010101, /* File A */ 
-    0x0202020202020202, /* File B */ 
-    0x0404040404040404, /* File C */ 
-    0x0808080808080808, /* File D */ 
-    0x1010101010101010, /* File E */ 
-    0x2020202020202020, /* File F */ 
-    0x4040404040404040, /* File G */ 
-    0x8080808080808080, /* File H */ 
+const SEARCH_DEPTH: usize = 3;
+const CHECKMATE_SCORE: i32 = 100_000;
+const FILE_MASKS: [Bitboard; 8] = [
+    0x0101010101010101,
+    0x0202020202020202,
+    0x0404040404040404,
+    0x0808080808080808,
+    0x1010101010101010,
+    0x2020202020202020,
+    0x4040404040404040,
+    0x8080808080808080,
 ];
-
-const RANK_MASKS: [u64; 8] = [
-    0x00000000000000FF, // Rank 1
-    0x000000000000FF00, // Rank 2
-    0x0000000000FF0000, // Rank 3
-    0x00000000FF000000, // Rank 4
-    0x000000FF00000000, // Rank 5
-    0x0000FF0000000000, // Rank 6
-    0x00FF000000000000, // Rank 7
-    0xFF00000000000000, // Rank 8
+const RANK_MASKS: [Bitboard; 8] = [
+    0x00000000000000FF,
+    0x000000000000FF00,
+    0x0000000000FF0000,
+    0x00000000FF000000,
+    0x000000FF00000000,
+    0x0000FF0000000000,
+    0x00FF000000000000,
+    0xFF00000000000000,
 ];
-
-const DOUBLE_PUSH_MASK: [u64; 2] = [
-    0x0000000000FF0000, // rank 3
-    0x0000FF0000000000, // rank 6
-];
+const FILE_ABB: Bitboard = FILE_MASKS[0];
+const FILE_HBB: Bitboard = FILE_MASKS[7];
+const DOUBLE_PUSH_MASK: [Bitboard; 2] = [RANK_MASKS[2], RANK_MASKS[5]];
 
 // chess colors
+#[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Color {
     White,
@@ -53,7 +110,7 @@ enum Color {
 }
 
 impl Color {
-    fn opposite(&self) -> Color {
+    fn opposite(self) -> Color {
         match self {
             Color::White => Color::Black,
             Color::Black => Color::White,
@@ -73,21 +130,7 @@ enum PieceKind {
     King,
 }
 
-impl PieceKind {
-    fn from_u8(p : u8) -> PieceKind {
-        match p {
-            0 => PieceKind::Empty,
-            1 => PieceKind::Pawn,
-            2 => PieceKind::Knight,
-            3 => PieceKind::Bishop,
-            4 => PieceKind::Rook,
-            5 => PieceKind::Queen,
-            6 => PieceKind::King,
-            _ => panic!("Invalid piece kind: {}", p),
-        }
-    }
-}
-
+#[repr(i32)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Piece {
     Empty,
@@ -105,16 +148,9 @@ enum Piece {
     BlackKing,
 }
 
-enum MoveType {
-    Normal,
-    Promotion,
-    EnPassant,
-    Castling,
-}
-
 impl Piece {
-    fn kind(&self) -> PieceKind {
-        match *self {
+    fn kind(self) -> PieceKind {
+        match self {
             Piece::Empty => PieceKind::Empty,
             Piece::WhitePawn | Piece::BlackPawn => PieceKind::Pawn,
             Piece::WhiteKnight | Piece::BlackKnight => PieceKind::Knight,
@@ -125,58 +161,124 @@ impl Piece {
         }
     }
 
-    fn color(&self) -> Color {
-        let is_odd = *self as u8 & 1;
-        if is_odd == 0 { Color::Black } else { Color::White }
+    fn color(self) -> Color {
+        match self {
+            Piece::WhitePawn
+            | Piece::WhiteKnight
+            | Piece::WhiteBishop
+            | Piece::WhiteRook
+            | Piece::WhiteQueen
+            | Piece::WhiteKing => Color::White,
+            Piece::BlackPawn
+            | Piece::BlackKnight
+            | Piece::BlackBishop
+            | Piece::BlackRook
+            | Piece::BlackQueen
+            | Piece::BlackKing => Color::Black,
+            Piece::Empty => panic!("empty piece has no color"),
+        }
+    }
+
+    fn from_kind_color(kind: PieceKind, color: Color) -> Piece {
+        match (kind, color) {
+            (PieceKind::Empty, _) => Piece::Empty,
+            (PieceKind::Pawn, Color::White) => Piece::WhitePawn,
+            (PieceKind::Pawn, Color::Black) => Piece::BlackPawn,
+            (PieceKind::Knight, Color::White) => Piece::WhiteKnight,
+            (PieceKind::Knight, Color::Black) => Piece::BlackKnight,
+            (PieceKind::Bishop, Color::White) => Piece::WhiteBishop,
+            (PieceKind::Bishop, Color::Black) => Piece::BlackBishop,
+            (PieceKind::Rook, Color::White) => Piece::WhiteRook,
+            (PieceKind::Rook, Color::Black) => Piece::BlackRook,
+            (PieceKind::Queen, Color::White) => Piece::WhiteQueen,
+            (PieceKind::Queen, Color::Black) => Piece::BlackQueen,
+            (PieceKind::King, Color::White) => Piece::WhiteKing,
+            (PieceKind::King, Color::Black) => Piece::BlackKing,
+        }
     }
 }
 
 type Bitboard = u64;
 type Square = u32;
 
-/// bit  0-5: destination square (from 0 to 63)
-/// bit  6-11: origin square (from 0 to 63)
-/// bit 12-13: promotion piece type - 2 (from KNIGHT-2 to QUEEN-2)
-/// bit 14-15: special move flag: promotion (1), en passant (2), castling (3)
-/// NOTE: en passant bit is set only when a pawn can be captured
+/// bits 0-5: destination square, bits 6-11: origin square
 type Move = u32;
 
-fn destination_square(m : Move) -> Square {
+#[repr(i32)]
+#[derive(Copy, Clone)]
+enum Direction {
+    North = 8,
+    East = 1,
+    South = -8,
+    West = -1,
+    NorthEast = 9,
+    SouthEast = -7,
+    SouthWest = -9,
+    NorthWest = 7,
+}
+
+const BISHOP_DIRECTIONS: [Direction; 4] = [
+    Direction::NorthEast,
+    Direction::NorthWest,
+    Direction::SouthEast,
+    Direction::SouthWest,
+];
+const ROOK_DIRECTIONS: [Direction; 4] = [
+    Direction::North,
+    Direction::East,
+    Direction::South,
+    Direction::West,
+];
+const KING_DIRECTIONS: [Direction; 8] = [
+    Direction::North,
+    Direction::NorthEast,
+    Direction::East,
+    Direction::SouthEast,
+    Direction::South,
+    Direction::SouthWest,
+    Direction::West,
+    Direction::NorthWest,
+];
+
+fn destination_square(m: Move) -> Square {
     return m & 0x3F;
 }
 
-fn origin_square(m : Move) -> Square {
+fn origin_square(m: Move) -> Square {
     return (m >> 6) & 0x3F;
 }
 
 #[derive(Copy, Clone)]
 struct Position {
     positions: [Bitboard; 7], // empty, pawn, knight, bishop, rook, queen, king
-    colors: [Bitboard; 2], // white, black
+    colors: [Bitboard; 2],    // white, black
     by_piece: [Piece; 64],
-    side_to_move : Color,
+    side_to_move: Color,
 }
 
-fn set_square(bitboard : &mut Bitboard, square : Square) {
-    *bitboard |= 1 << square;
+fn set_square(bitboard: &mut Bitboard, square: Square) {
+    *bitboard |= 1u64 << square;
 }
 
-fn unset_square(bitboard : &mut Bitboard, square : Square) {
-    *bitboard &= !(1 << square);
+fn unset_square(bitboard: &mut Bitboard, square: Square) {
+    *bitboard &= !(1u64 << square);
 }
 
 impl Position {
     fn new() -> Position {
+        Position::from_board(INITIAL_PIECES, Color::White)
+    }
+
+    fn from_board(by_piece: [Piece; 64], side_to_move: Color) -> Position {
         let mut position = Position {
             positions: [0; 7],
             colors: [0; 2],
-            by_piece: INITIAL_PIECES,
-            side_to_move: Color::White,
+            by_piece,
+            side_to_move,
         };
 
-        for i in 0..64 {
+        for (i, piece) in position.by_piece.iter().copied().enumerate() {
             let square = i as Square;
-            let piece = INITIAL_PIECES[i];
             let pos = &mut position.positions[piece.kind() as usize];
             set_square(pos, square);
             if piece != Piece::Empty {
@@ -190,36 +292,75 @@ impl Position {
         position
     }
 
-    fn pieces(&self, c : Color, kind : PieceKind) -> Bitboard {
+    fn occupied(&self) -> Bitboard {
+        self.colors[Color::White as usize] | self.colors[Color::Black as usize]
+    }
+
+    fn pieces(&self, c: Color, kind: PieceKind) -> Bitboard {
         self.colors[c as usize] & self.positions[kind as usize]
     }
 
-    fn do_move(&mut self, m : Move) {
+    fn king_square(&self, c: Color) -> Option<Square> {
+        let kings = self.pieces(c, PieceKind::King);
+        if kings == 0 {
+            None
+        } else {
+            Some(kings.trailing_zeros())
+        }
+    }
+
+    fn do_move(&mut self, m: Move) {
         let origin = origin_square(m);
         let destination = destination_square(m);
 
-        //println!("doing move {} -> {}", origin, destination);
+        let moving_piece = self.by_piece[origin as usize];
+        assert!(moving_piece != Piece::Empty, "cannot move an empty square");
+        assert_eq!(
+            moving_piece.color(),
+            self.side_to_move,
+            "cannot move the opponent's piece"
+        );
+
+        let target_piece = self.by_piece[destination as usize];
+        assert!(
+            target_piece == Piece::Empty || target_piece.color() != self.side_to_move,
+            "cannot capture your own piece"
+        );
 
         let us = self.side_to_move as usize;
         let them = self.side_to_move.opposite() as usize;
 
         // color bitboards
-        unset_square(&mut self.colors[them], destination);
         unset_square(&mut self.colors[us], origin);
         set_square(&mut self.colors[us], destination);
+        if target_piece != Piece::Empty {
+            unset_square(&mut self.colors[them], destination);
+        }
 
-        // set origin to empty and 
+        // origin becomes empty, destination stops being empty if needed
         set_square(&mut self.positions[PieceKind::Empty as usize], origin);
-
-        let moving_piece_kind = self.by_piece[origin as usize].kind() as usize;
-        let target_piece_kind = self.by_piece[destination as usize].kind() as usize;
+        let moving_piece_kind = moving_piece.kind() as usize;
+        let target_piece_kind = target_piece.kind() as usize;
 
         unset_square(&mut self.positions[moving_piece_kind], origin);
         unset_square(&mut self.positions[target_piece_kind], destination);
-        set_square(&mut self.positions[moving_piece_kind], destination);
+
+        let destination_rank = destination / 8;
+        let moved_piece = if moving_piece.kind() == PieceKind::Pawn
+            && (destination_rank == 0 || destination_rank == 7)
+        {
+            Piece::from_kind_color(PieceKind::Queen, self.side_to_move)
+        } else {
+            moving_piece
+        };
+
+        set_square(
+            &mut self.positions[moved_piece.kind() as usize],
+            destination,
+        );
 
         // explicit piece array
-        self.by_piece[destination as usize] = self.by_piece[origin as usize];
+        self.by_piece[destination as usize] = moved_piece;
         self.by_piece[origin as usize] = Piece::Empty;
 
         self.side_to_move = self.side_to_move.opposite();
@@ -227,93 +368,99 @@ impl Position {
         assert!(self.is_consistent());
     }
 
-    fn value(&self) -> u32 {
-        let us = self.side_to_move as usize;
+    fn material(&self, color: Color) -> i32 {
+        let color_mask = self.colors[color as usize];
 
         let mut value = 0;
-        let color_mask = self.colors[us];
-
-        value += (self.positions[PieceKind::Pawn as usize] & color_mask).count_ones() * 100;
-        value += (self.positions[PieceKind::Knight as usize] & color_mask).count_ones() * 320;
-        value += (self.positions[PieceKind::Bishop as usize] & color_mask).count_ones() * 330;
-        value += (self.positions[PieceKind::Rook as usize] & color_mask).count_ones() * 500;
-        value += (self.positions[PieceKind::Queen as usize] & color_mask).count_ones() * 900;
-        value += (self.positions[PieceKind::King as usize] & color_mask).count_ones() * 20000;
-
+        value += (self.positions[PieceKind::Pawn as usize] & color_mask).count_ones() as i32 * 100;
+        value +=
+            (self.positions[PieceKind::Knight as usize] & color_mask).count_ones() as i32 * 320;
+        value +=
+            (self.positions[PieceKind::Bishop as usize] & color_mask).count_ones() as i32 * 330;
+        value += (self.positions[PieceKind::Rook as usize] & color_mask).count_ones() as i32 * 500;
+        value += (self.positions[PieceKind::Queen as usize] & color_mask).count_ones() as i32 * 900;
+        value +=
+            (self.positions[PieceKind::King as usize] & color_mask).count_ones() as i32 * 20000;
         value
     }
 
+    fn evaluate(&self) -> i32 {
+        self.material(self.side_to_move) - self.material(self.side_to_move.opposite())
+    }
+
     fn is_consistent(&self) -> bool {
+        let occupied = self.occupied();
         for i in 0..64 {
             let piece = self.by_piece[i as usize];
-            let bb : u64 = 1 << i as u64;
+            let bb: u64 = 1u64 << i as u64;
             if self.positions[piece.kind() as usize] & bb == 0 {
                 return false;
             }
-            if piece.kind() != PieceKind::Empty {
+            if piece != Piece::Empty {
                 let c = piece.color();
                 if self.colors[c as usize] & bb == 0 {
                     return false;
                 }
+            } else if occupied & bb != 0 {
+                return false;
             }
         }
         true
-    }    
+    }
+
+    fn in_check(&self, color: Color) -> bool {
+        self.king_square(color)
+            .is_some_and(|square| is_square_attacked(self, square, color.opposite()))
+    }
 }
 
-fn pop_square(board : &mut Bitboard) -> Square {
+fn pop_square(board: &mut Bitboard) -> Square {
     let s = board.trailing_zeros();
     *board = *board & (*board - 1);
     s
 }
 
-// TODO: en-passant
-fn pawn_attacks(us : usize, square : Square) -> Bitboard {
-    let mut attacks = 0;
-    //if square % 8 != 0 {
-    //    attacks |= 1 << (square as Bitboard - 9 + 16 * us as Bitboard);
-    //}
-    //if square % 8 != 7 {
-    //    attacks |= 1 << (square as Bitboard - 7 + 16 * us as Bitboard);
-    //}
-    attacks
-}
-
 #[derive(Copy, Clone)]
 struct Moves {
-    moves : [Move; 256],
-    num_moves : usize,
+    moves: [Move; 256],
+    num_moves: usize,
 }
 
-fn create_move_advanced(origin : Square, destination : Square, promotion : PieceKind, move_type : MoveType) -> Move {
+fn create_move(origin: Square, destination: Square) -> Move {
     let mut m = destination;
     m |= origin << 6;
-    m |= (promotion as u32) << 12;
-    m |= (move_type as u32) << 14;
     m
-}
-
-fn create_move(origin : Square, destination : Square) -> Move {
-    create_move_advanced(origin, destination, PieceKind::Empty, MoveType::Normal)
 }
 
 impl Moves {
     fn new() -> Moves {
-        Moves{moves : [0; 256], num_moves : 0}
+        Moves {
+            moves: [0; 256],
+            num_moves: 0,
+        }
     }
-    fn push(&mut self, m : Move) {
+    fn push(&mut self, m: Move) {
+        debug_assert!(self.num_moves < self.moves.len());
         self.moves[self.num_moves] = m;
         self.num_moves += 1;
     }
 
-    fn iter(&self) -> MoveIter {
-        MoveIter{moves : self, idx : 0}
+    fn iter(&self) -> MoveIter<'_> {
+        MoveIter {
+            moves: self,
+            idx: 0,
+        }
+    }
+
+    fn find(&self, origin: Square, destination: Square) -> Option<Move> {
+        self.iter()
+            .find(|m| origin_square(*m) == origin && destination_square(*m) == destination)
     }
 }
 
 struct MoveIter<'a> {
-    moves : &'a Moves,
-    idx : usize,
+    moves: &'a Moves,
+    idx: usize,
 }
 
 impl<'a> Iterator for MoveIter<'a> {
@@ -329,22 +476,11 @@ impl<'a> Iterator for MoveIter<'a> {
     }
 }
 
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum Direction {
-    North =  8,
-    East  =  1,
-    South = -8,
-    West  = -1,
-    NorthEast = 9,
-    SouthEast = -7,
-    SouthWest = -9,
-    NorthWest = 7,
+fn to_bb(s: Square) -> Bitboard {
+    1u64 << s
 }
 
-const FILE_ABB : Bitboard = 0x0101010101010101;
-const FILE_HBB : Bitboard = FILE_ABB << 7;
-fn shift(bb : Bitboard, dir : Direction) -> Bitboard {
+fn shift(bb: Bitboard, dir: Direction) -> Bitboard {
     match dir {
         Direction::North => bb << 8,
         Direction::South => bb >> 8,
@@ -357,203 +493,402 @@ fn shift(bb : Bitboard, dir : Direction) -> Bitboard {
     }
 }
 
-fn pawn_push(c : Color) -> Direction {
-    match c {
+fn pawn_push(color: Color) -> Direction {
+    match color {
         Color::White => Direction::North,
         Color::Black => Direction::South,
     }
 }
 
-fn to_bb(s : Square) -> Bitboard{
-    1 << s as u64
-}
-
-fn get_attacks(from : Square, pos : &Position, piece_kind : PieceKind) -> Bitboard {
-    if piece_kind == PieceKind::Knight {
-        let x0 = (from % 8) as i32;
-        let y0 = (from / 8) as i32;
-        let mut b : u64 = 0;
-        for (x,y) in [(2,1), (2,-1), (-2,1), (-2,-1), (2,1), (2,-1), (-2,1), (-2,-1)] {
-            let x1 = x0 + x;
-            let y1 = y0 + y;
-            if x1 >=0 && x1 < 8 && y1 >= 0 && y1 < 8 {
-                let s = (8 * y1 + x1) as Square;
-                b |= to_bb(s);
-            }
-        }
-        return b;
+fn pawn_capture_directions(color: Color) -> [Direction; 2] {
+    match color {
+        Color::White => [Direction::NorthWest, Direction::NorthEast],
+        Color::Black => [Direction::SouthWest, Direction::SouthEast],
     }
-    0
 }
 
-fn generate_moves(pos : &Position, moves : &mut Moves, target : Bitboard, piece_kind : PieceKind) {
-
-  assert!(piece_kind != PieceKind::King && piece_kind != PieceKind::Pawn, "Unsupported piece type");
-
-  let us = pos.side_to_move;
-
-  let mut bb = pos.pieces(us, piece_kind);
-
-  let mask = !pos.colors[us as usize];
-
-  while bb != 0
-  {
-    let from = pop_square(&mut bb);
-    let mut b = get_attacks(from, pos, piece_kind) & mask;
-
-    //println!("num knight attacks {}", b.count_ones());
-
-      // To check, you either move freely a blocker or make a direct check.
-      //if (Checks && (Pt == QUEEN || !(pos.blockers_for_king(~Us) & from)))
-      //    b &= pos.check_squares(Pt);
-
-      while b != 0 {
-        moves.push(create_move(from, pop_square(&mut b)));
-      }
-  }
+fn knight_attacks(from: Square) -> Bitboard {
+    let bb = to_bb(from);
+    shift(shift(bb, Direction::North), Direction::NorthEast)
+        | shift(shift(bb, Direction::North), Direction::NorthWest)
+        | shift(shift(bb, Direction::South), Direction::SouthEast)
+        | shift(shift(bb, Direction::South), Direction::SouthWest)
+        | shift(shift(bb, Direction::East), Direction::NorthEast)
+        | shift(shift(bb, Direction::East), Direction::SouthEast)
+        | shift(shift(bb, Direction::West), Direction::NorthWest)
+        | shift(shift(bb, Direction::West), Direction::SouthWest)
 }
 
-fn generate_pawn_moves(position : &Position, moves : &mut Moves) {
-    let us_color = position.side_to_move;
-    let us = us_color as usize;
-    let them = us_color.opposite() as usize;
+fn king_attacks(from: Square) -> Bitboard {
+    let bb = to_bb(from);
+    let mut attacks = 0;
+    for dir in KING_DIRECTIONS {
+        attacks |= shift(bb, dir);
+    }
+    attacks
+}
 
-    let up = pawn_push(us_color);
-    let up_right = if us_color == Color::White {Direction::NorthEast} else {Direction::SouthEast};
-    let up_left = if us_color == Color::White {Direction::NorthWest} else {Direction::SouthWest};
+fn ray_attacks(from: Bitboard, occupied: Bitboard, dir: Direction) -> Bitboard {
+    let mut attacks = 0;
+    let mut current = from;
 
-    //println!("us {:?}", us);
+    loop {
+        current = shift(current, dir);
+        if current == 0 {
+            break;
+        }
 
+        attacks |= current;
+        if current & occupied != 0 {
+            break;
+        }
+    }
+
+    attacks
+}
+
+fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[Direction]) -> Bitboard {
+    let mut attacks = 0;
+    let bb = to_bb(from);
+    for &dir in directions {
+        attacks |= ray_attacks(bb, occupied, dir);
+    }
+    attacks
+}
+
+fn get_attacks(from: Square, position: &Position, piece_kind: PieceKind) -> Bitboard {
+    match piece_kind {
+        PieceKind::Knight => knight_attacks(from),
+        PieceKind::Bishop => sliding_attacks(from, position.occupied(), &BISHOP_DIRECTIONS),
+        PieceKind::Rook => sliding_attacks(from, position.occupied(), &ROOK_DIRECTIONS),
+        PieceKind::Queen => {
+            sliding_attacks(from, position.occupied(), &BISHOP_DIRECTIONS)
+                | sliding_attacks(from, position.occupied(), &ROOK_DIRECTIONS)
+        }
+        PieceKind::King => king_attacks(from),
+        PieceKind::Empty | PieceKind::Pawn => 0,
+    }
+}
+
+fn generate_piece_moves(position: &Position, moves: &mut Moves, piece_kind: PieceKind) {
+    let us = position.side_to_move;
+    let own_pieces = position.colors[us as usize];
+    let enemy_king = position.pieces(us.opposite(), PieceKind::King);
+    let mut pieces = position.pieces(us, piece_kind);
+
+    while pieces != 0 {
+        let from = pop_square(&mut pieces);
+        let mut targets = get_attacks(from, position, piece_kind) & !own_pieces & !enemy_king;
+        while targets != 0 {
+            moves.push(create_move(from, pop_square(&mut targets)));
+        }
+    }
+}
+
+fn generate_pawn_moves(position: &Position, moves: &mut Moves) {
+    let us = position.side_to_move;
+    let them = us.opposite();
+    let up = pawn_push(us);
+    let [up_left, up_right] = pawn_capture_directions(us);
     let empty = position.positions[PieceKind::Empty as usize];
-    let pawns = position.colors[us] & position.positions[PieceKind::Pawn as usize];
-    let enemies = position.colors[them];
+    let pawns = position.pieces(us, PieceKind::Pawn);
+    let enemy_king = position.pieces(them, PieceKind::King);
+    let enemy_pieces = position.colors[them as usize] & !enemy_king;
+    let direction_offset = |dir: Direction| dir as i32;
 
-    let b = shift(pawns, up);
-
-    // captures
-    {
-        let mut b1 = shift(b, Direction::East) & enemies;
-        while b1 != 0 {
-            let destination = pop_square(&mut b1);
-            let origin = destination as i32 - up_right as i32; 
-            //println!("generating pawn capture {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination));
-        }
-
-        let mut b2 = shift(b, Direction::West) & enemies;
-        while b2 != 0 {
-            let destination = pop_square(&mut b2);
-            let origin = destination as i32 - up_left as i32; 
-            //println!("generating pawn capture {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination));
-        }
+    let mut single_pushes = shift(pawns, up) & empty;
+    while single_pushes != 0 {
+        let destination = pop_square(&mut single_pushes);
+        let origin = (destination as i32 - direction_offset(up)) as Square;
+        moves.push(create_move(origin, destination));
     }
 
-    {
-        // single pawn push
-        let mut b1 = b & empty;
+    let mut double_pushes = shift(
+        (shift(pawns, up) & empty) & DOUBLE_PUSH_MASK[us as usize],
+        up,
+    ) & empty;
+    while double_pushes != 0 {
+        let destination = pop_square(&mut double_pushes);
+        let origin = (destination as i32 - 2 * direction_offset(up)) as Square;
+        moves.push(create_move(origin, destination));
+    }
 
-        while b1 != 0 {
-            let destination = pop_square(&mut b1);
-            let origin = destination as i32 - up as i32;
-            //println!("generating single push move {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination));
-        }
+    let mut left_captures = shift(pawns, up_left) & enemy_pieces;
+    while left_captures != 0 {
+        let destination = pop_square(&mut left_captures);
+        let origin = (destination as i32 - direction_offset(up_left)) as Square;
+        moves.push(create_move(origin, destination));
+    }
 
-        // double pawn push
-        let mut b2 = shift(b & empty & DOUBLE_PUSH_MASK[us], up) & empty;
-
-        //println!("num double pushes {}",b2.count_ones());
-
-        while b2 != 0 {
-            let destination = pop_square(&mut b2);
-            let origin = destination as i32 - 2*(up as i32);
-            //println!("generating two push move {} -> {}", origin, destination);
-            moves.push(create_move(origin as u32, destination));
-        }
+    let mut right_captures = shift(pawns, up_right) & enemy_pieces;
+    while right_captures != 0 {
+        let destination = pop_square(&mut right_captures);
+        let origin = (destination as i32 - direction_offset(up_right)) as Square;
+        moves.push(create_move(origin, destination));
     }
 }
 
-fn generate_all_moves(position : &Position) -> Moves {
+fn generate_pseudo_legal_moves(position: &Position) -> Moves {
     let mut moves = Moves::new();
-    let target = !position.colors[position.side_to_move as usize];
-    generate_moves(position, &mut moves, target, PieceKind::Knight);
+    generate_piece_moves(position, &mut moves, PieceKind::Knight);
+    generate_piece_moves(position, &mut moves, PieceKind::Bishop);
+    generate_piece_moves(position, &mut moves, PieceKind::Rook);
+    generate_piece_moves(position, &mut moves, PieceKind::Queen);
+    generate_piece_moves(position, &mut moves, PieceKind::King);
     generate_pawn_moves(position, &mut moves);
     moves
 }
 
-fn alpha_beta_search(position : &Position, depth : usize, alpha_ : i32, beta_ : i32, maximizing_player : bool) -> i32 {
-    if depth == 0 {
-        return position.value() as i32;
-    }
-    let moves = generate_all_moves(position);
-    if moves.num_moves == 0  {
-        return position.value() as i32;
+fn slider_attacks_square(
+    position: &Position,
+    square: Square,
+    pieces: Bitboard,
+    directions: &[Direction],
+) -> bool {
+    let target = to_bb(square);
+    let occupied = position.occupied();
+    let mut pieces = pieces;
+
+    while pieces != 0 {
+        let from = pop_square(&mut pieces);
+        if sliding_attacks(from, occupied, directions) & target != 0 {
+            return true;
+        }
     }
 
-    let mut alpha = alpha_;
-    let mut beta = beta_;
-
-    if maximizing_player {
-        let mut value = i32::MIN;
-        for m in moves.iter() {
-            let mut new_position: Position = position.clone();
-            new_position.do_move(m);
-            value = max(value, alpha_beta_search(&new_position, depth - 1, alpha, beta, false));
-            if value > beta {
-                break;
-            }
-            alpha = max(alpha, value);
-        }
-        return value;
-    }
-    else {
-        let mut value = i32::MAX;
-        for m in moves.iter() {
-            let mut new_position: Position = position.clone();
-            new_position.do_move(m);
-            value = max(value, alpha_beta_search(&new_position, depth - 1, alpha, beta, true));
-            if value < alpha {
-                break;
-            }
-            beta = min(beta, value);
-        }
-        return value;
-    }
+    false
 }
 
-fn make_move(position : &mut Position) {
-    let moves = generate_all_moves(position);
-    let mut best_move = 0;
-    let mut best_value = i32::MIN;
+fn is_square_attacked(position: &Position, square: Square, attacker: Color) -> bool {
+    let target = to_bb(square);
+    let pawns = position.pieces(attacker, PieceKind::Pawn);
+    let [up_left, up_right] = pawn_capture_directions(attacker);
+    if (shift(pawns, up_left) | shift(pawns, up_right)) & target != 0 {
+        return true;
+    }
+
+    let mut knights = position.pieces(attacker, PieceKind::Knight);
+    while knights != 0 {
+        let from = pop_square(&mut knights);
+        if knight_attacks(from) & target != 0 {
+            return true;
+        }
+    }
+
+    if let Some(king_square) = position.king_square(attacker) {
+        if king_attacks(king_square) & target != 0 {
+            return true;
+        }
+    }
+
+    slider_attacks_square(
+        position,
+        square,
+        position.pieces(attacker, PieceKind::Bishop) | position.pieces(attacker, PieceKind::Queen),
+        &BISHOP_DIRECTIONS,
+    ) || slider_attacks_square(
+        position,
+        square,
+        position.pieces(attacker, PieceKind::Rook) | position.pieces(attacker, PieceKind::Queen),
+        &ROOK_DIRECTIONS,
+    )
+}
+
+fn generate_legal_moves(position: &Position) -> Moves {
+    let pseudo_legal_moves = generate_pseudo_legal_moves(position);
+    let mut legal_moves = Moves::new();
+    let side_to_move = position.side_to_move;
+
+    for m in pseudo_legal_moves.iter() {
+        let mut next = *position;
+        next.do_move(m);
+        if !next.in_check(side_to_move) {
+            legal_moves.push(m);
+        }
+    }
+
+    legal_moves
+}
+
+fn negamax(position: &Position, depth: usize, mut alpha: i32, beta: i32) -> i32 {
+    if depth == 0 {
+        return position.evaluate();
+    }
+
+    let moves = generate_legal_moves(position);
+    if moves.num_moves == 0 {
+        return if position.in_check(position.side_to_move) {
+            -CHECKMATE_SCORE + depth as i32
+        } else {
+            0
+        };
+    }
+
+    let mut best_value = -CHECKMATE_SCORE;
     for m in moves.iter() {
-        let v = alpha_beta_search(position, 3, i32::MIN, i32::MAX, true);
-        //let mut p = position.clone();
-        //p.do_move(m);
-        //let v = p.value() as i32;
-        // choose position which has the lowest valuation for the opponent
+        let mut new_position = *position;
+        new_position.do_move(m);
+        let value = -negamax(&new_position, depth - 1, -beta, -alpha);
+        if value > best_value {
+            best_value = value;
+        }
+        if value > alpha {
+            alpha = value;
+        }
+        if alpha >= beta {
+            break;
+        }
+    }
+
+    best_value
+}
+
+fn make_move(position: &mut Position) -> bool {
+    let moves = generate_legal_moves(position);
+    if moves.num_moves == 0 {
+        return false;
+    }
+
+    let mut best_move = moves.moves[0];
+    let mut best_value = -CHECKMATE_SCORE;
+    for m in moves.iter() {
+        let mut next = *position;
+        next.do_move(m);
+        let v = -negamax(
+            &next,
+            SEARCH_DEPTH.saturating_sub(1),
+            -CHECKMATE_SCORE,
+            CHECKMATE_SCORE,
+        );
         if v > best_value {
             best_move = m;
             best_value = v;
         }
     }
+
     position.do_move(best_move);
+    true
+}
+
+fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
+    let legal_moves = generate_legal_moves(position);
+    if let Some(m) = legal_moves.find(origin, destination) {
+        position.do_move(m);
+        return true;
+    }
+    false
+}
+
+fn mouse_to_square(
+    position: PhysicalPosition<f64>,
+    window_size: PhysicalSize<u32>,
+) -> Option<Square> {
+    if window_size.width == 0 || window_size.height == 0 {
+        return None;
+    }
+
+    let x = (position.x / window_size.width as f64 * 8.0).floor() as i32;
+    let y = 7 - (position.y / window_size.height as f64 * 8.0).floor() as i32;
+
+    if !(0..8).contains(&x) || !(0..8).contains(&y) {
+        return None;
+    }
+
+    Some((x + y * 8) as Square)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_with(pieces: &[(Square, Piece)], side_to_move: Color) -> Position {
+        let mut board = [Piece::Empty; 64];
+        for &(square, piece) in pieces {
+            board[square as usize] = piece;
+        }
+        Position::from_board(board, side_to_move)
+    }
+
+    #[test]
+    fn initial_position_has_twenty_legal_moves() {
+        let position = Position::new();
+        assert_eq!(generate_legal_moves(&position).num_moves, 20);
+    }
+
+    #[test]
+    fn knight_attacks_from_the_center_cover_all_eight_squares() {
+        let position = Position::new();
+        let attacks = get_attacks(27, &position, PieceKind::Knight);
+        let expected = [10, 12, 17, 21, 33, 37, 42, 44];
+
+        assert_eq!(attacks.count_ones(), expected.len() as u32);
+        for square in expected {
+            assert_ne!(attacks & to_bb(square), 0);
+        }
+    }
+
+    #[test]
+    fn blocked_rook_move_is_not_legal() {
+        let position = Position::new();
+        assert!(generate_legal_moves(&position).find(0, 16).is_none());
+    }
+
+    #[test]
+    fn evaluation_is_relative_to_the_side_to_move() {
+        let white_to_move = board_with(
+            &[
+                (4, Piece::WhiteKing),
+                (60, Piece::BlackKing),
+                (3, Piece::WhiteQueen),
+            ],
+            Color::White,
+        );
+        let black_to_move = board_with(
+            &[
+                (4, Piece::WhiteKing),
+                (60, Piece::BlackKing),
+                (3, Piece::WhiteQueen),
+            ],
+            Color::Black,
+        );
+
+        assert_eq!(white_to_move.evaluate(), 900);
+        assert_eq!(black_to_move.evaluate(), -900);
+    }
+
+    #[test]
+    fn engine_prefers_the_winning_capture() {
+        let mut position = board_with(
+            &[
+                (7, Piece::WhiteKing),
+                (0, Piece::WhiteRook),
+                (56, Piece::BlackQueen),
+                (63, Piece::BlackKing),
+            ],
+            Color::White,
+        );
+
+        assert!(position.in_check(Color::White));
+        assert!(make_move(&mut position));
+        assert_eq!(position.by_piece[56], Piece::WhiteRook);
+        assert_eq!(position.by_piece[0], Piece::Empty);
+    }
 }
 
 #[repr(C, align(16))]
 #[derive(Debug, Copy, Clone)]
 struct GpuBoard {
-    pieces : [i32; 64],
+    pieces: [i32; 64],
 }
 
 unsafe impl Zeroable for GpuBoard {}
 unsafe impl Pod for GpuBoard {}
 
 impl GpuBoard {
-    fn new(pos : &Position) -> GpuBoard {
-        let mut board = GpuBoard{ pieces : [0; 64]};
+    fn new(pos: &Position) -> GpuBoard {
+        let mut board = GpuBoard { pieces: [0; 64] };
         for i in 0..64 {
-           board.pieces[i] = pos.by_piece[i] as i32;
+            board.pieces[i] = pos.by_piece[i] as i32;
         }
         board
     }
@@ -601,7 +936,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     });
 
     let mut position = Position::new();
-    let mut gpu_board = GpuBoard::new(&position);
+    let gpu_board = GpuBoard::new(&position);
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Uniform Buffer"),
@@ -611,29 +946,25 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(18 * 4),
-                },
-                count: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<GpuBoard>() as u64),
             },
-        ],
+            count: None,
+        }],
     });
 
     // Create bind group
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-        ],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buf.as_entire_binding(),
+        }],
         label: None,
     });
 
@@ -676,15 +1007,15 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     };
 
     surface.configure(&device, &config);
+    window.request_redraw();
 
-    let mut mouse_down = false;
     let mut current_mouse_pos = None;
 
     // array of two mouse positions
     let mut i = 0;
-    let mut mouse_positions: [PhysicalPosition<f64>; 2] = [winit::dpi::PhysicalPosition::default(); 2];
+    let mut mouse_positions: [PhysicalPosition<f64>; 2] =
+        [winit::dpi::PhysicalPosition::default(); 2];
     let mut move_piece = false;
-    let mut waiting_for_promotion = false;
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
@@ -710,67 +1041,28 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 ..
             } => {
                 if button == MouseButton::Left {
-                    mouse_down = state == winit::event::ElementState::Pressed;
-
-                    if !mouse_down {
-                        let mouse_pos : PhysicalPosition<f64> = current_mouse_pos.unwrap();
-                        mouse_positions[i] = mouse_pos;
-                        move_piece = i == 1;
-                        i = (i + 1) % 2;
+                    if state == winit::event::ElementState::Released {
+                        if let Some(mouse_pos) = current_mouse_pos {
+                            mouse_positions[i] = mouse_pos;
+                            move_piece = i == 1;
+                            i = (i + 1) % 2;
+                        }
                     }
+
                     if move_piece {
                         move_piece = false;
-                        let last_pos = mouse_positions[0];
-                        let current_pos = mouse_positions[1];
                         let window_size = window.inner_size();
-
-                        let height = window_size.height as f64;
-                        let width = window_size.width as f64;
-
-                        //println!("{}, {}", last_pos.x, last_pos.y);
-                        //println!("{}, {}", current_pos.x, current_pos.y);
-                        //println!("{}, {}", width, height);
-
-                        let square_size = 1./8.;
-
-                        let last_x = (last_pos.x / width / square_size).floor() as i32;
-                        let mut last_y = (last_pos.y / height / square_size).floor() as i32;
-                        last_y = 7 - last_y;
-
-                        let current_x = (current_pos.x / width / square_size).floor() as i32;
-                        let mut current_y = (current_pos.y / height / square_size).floor() as i32;
-                        current_y = 7 - current_y;
-
-                        let from = last_x + last_y * 8;
-                        let to = current_x + current_y * 8;
-                        
-                        //println!("{} -> {}", from, to);
-
-                        let m = create_move(from as u32, to as u32);
-
-                        let rank = to / 8;
-                        if position.by_piece[from as usize].kind() == PieceKind::Pawn && (rank == 0 || rank == 7) {
-                            waiting_for_promotion = true;
+                        if let (Some(from), Some(to)) = (
+                            mouse_to_square(mouse_positions[0], window_size),
+                            mouse_to_square(mouse_positions[1], window_size),
+                        ) {
+                            if try_player_move(&mut position, from, to) {
+                                let _ = make_move(&mut position);
+                                let gpu_board = GpuBoard::new(&position);
+                                queue.write_buffer(&uniform_buf, 0, gpu_board.as_byte_slice());
+                                window.request_redraw();
+                            }
                         }
-
-                        position.do_move(m);
-                        
-
-                        //println!("computing moves for color {:?}", position.side_to_move);
-                        //for m in generate_moves(&position).iter() {
-                        //    println!("{} -> {}", origin_square(m), destination_square(m));
-                        //}
-
-                        make_move(&mut position);
-
-                        gpu_board = GpuBoard::new(&position);
-
-                        queue.write_buffer(
-                            &uniform_buf,
-                            0,
-                            gpu_board.as_byte_slice(),
-                        );
-                        window.request_redraw();
                     }
                 }
             }

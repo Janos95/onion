@@ -325,4 +325,3 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     col = mix(col, vec3(0.0), 1.0-smoothstep(0.0,0.03,abs(d)) );
     return v4(col.x, col.y, col.z, 1.);
 }
-

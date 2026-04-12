@@ -2,18 +2,24 @@
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Wasm Bindgen Example</title>
+    <title>Onion</title>
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      canvas {
+        display: block;
+      }
+    </style>
   </head>
   <body>
     <script type="module">
       import init from './onion.js';
 
-      async function run() {
-        const wasm = await init();
-        console.log(wasm.main());
-      }
-
-      run();
+      init();
     </script>
   </body>
 </html>
