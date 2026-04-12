@@ -1,3 +1,8 @@
+use std::time::{Duration, Instant};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
 const INITIAL_PIECES: [Piece; 64] = [
     Piece::WhiteRook,
     Piece::WhiteKnight,
@@ -65,8 +70,9 @@ const INITIAL_PIECES: [Piece; 64] = [
     Piece::BlackRook,
 ];
 
-pub const SEARCH_DEPTH: usize = 3;
+pub const SEARCH_TIME_BUDGET_MS: u32 = 2_000;
 const CHECKMATE_SCORE: i32 = 100_000;
+const MAX_SEARCH_DEPTH: usize = 64;
 const FILE_MASKS: [Bitboard; 8] = [
     0x0101010101010101,
     0x0202020202020202,
@@ -90,6 +96,10 @@ const RANK_MASKS: [Bitboard; 8] = [
 const FILE_ABB: Bitboard = FILE_MASKS[0];
 const FILE_HBB: Bitboard = FILE_MASKS[7];
 const DOUBLE_PUSH_MASK: [Bitboard; 2] = [RANK_MASKS[2], RANK_MASKS[5]];
+const TT_BITS: usize = 18;
+const TT_SIZE: usize = 1 << TT_BITS;
+const TIME_CHECK_INTERVAL: u64 = 1 << 10;
+const ZOBRIST_SEED_INC: u64 = 0x9E37_79B9_7F4A_7C15;
 
 type Bitboard = u64;
 pub type Square = u32;
@@ -233,6 +243,7 @@ pub struct Position {
     colors: [Bitboard; 2],
     by_piece: [Piece; 64],
     side_to_move: Color,
+    hash: u64,
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -241,12 +252,110 @@ pub struct SearchStats {
     pub score: i32,
 }
 
-fn set_square(bitboard: &mut Bitboard, square: Square) {
-    *bitboard |= 1u64 << square;
+#[derive(Copy, Clone)]
+struct Undo {
+    moving_piece: Piece,
+    placed_piece: Piece,
+    captured_piece: Piece,
 }
 
-fn unset_square(bitboard: &mut Bitboard, square: Square) {
-    *bitboard &= !(1u64 << square);
+#[derive(Copy, Clone)]
+struct Moves {
+    moves: [Move; 256],
+    num_moves: usize,
+}
+
+struct MoveIter<'a> {
+    moves: &'a Moves,
+    idx: usize,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Bound {
+    Empty,
+    Exact,
+    Lower,
+    Upper,
+}
+
+#[derive(Copy, Clone)]
+struct TTEntry {
+    key: u64,
+    depth: u8,
+    score: i32,
+    best_move: Move,
+    bound: Bound,
+}
+
+impl Default for TTEntry {
+    fn default() -> Self {
+        TTEntry {
+            key: 0,
+            depth: 0,
+            score: 0,
+            best_move: 0,
+            bound: Bound::Empty,
+        }
+    }
+}
+
+struct TranspositionTable {
+    entries: Vec<TTEntry>,
+    mask: usize,
+}
+
+pub struct Searcher {
+    tt: TranspositionTable,
+}
+
+#[derive(Copy, Clone)]
+enum SearchAborted {
+    Timeout,
+}
+
+const fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+const fn generate_piece_hashes() -> [[u64; 64]; 13] {
+    let mut table = [[0; 64]; 13];
+    let mut piece = 1;
+    let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+
+    while piece < 13 {
+        let mut square = 0;
+        while square < 64 {
+            seed = seed.wrapping_add(ZOBRIST_SEED_INC);
+            table[piece][square] = mix64(seed);
+            square += 1;
+        }
+        piece += 1;
+    }
+
+    table
+}
+
+const ZOBRIST_PIECES: [[u64; 64]; 13] = generate_piece_hashes();
+const ZOBRIST_SIDE_TO_MOVE: u64 = mix64(0xCAFEBABE_DEADBEEF);
+
+fn piece_hash(piece: Piece, square: Square) -> u64 {
+    ZOBRIST_PIECES[piece as usize][square as usize]
+}
+
+fn piece_value(kind: PieceKind) -> i32 {
+    match kind {
+        PieceKind::Empty => 0,
+        PieceKind::Pawn => 100,
+        PieceKind::Knight => 320,
+        PieceKind::Bishop => 330,
+        PieceKind::Rook => 500,
+        PieceKind::Queen => 900,
+        PieceKind::King => 20_000,
+    }
 }
 
 fn destination_square(m: Move) -> Square {
@@ -257,212 +366,12 @@ fn origin_square(m: Move) -> Square {
     (m >> 6) & 0x3F
 }
 
-impl Position {
-    pub fn new() -> Position {
-        Position::from_board(INITIAL_PIECES, Color::White)
-    }
-
-    fn from_board(by_piece: [Piece; 64], side_to_move: Color) -> Position {
-        let mut position = Position {
-            positions: [0; 7],
-            colors: [0; 2],
-            by_piece,
-            side_to_move,
-        };
-
-        for (i, piece) in position.by_piece.iter().copied().enumerate() {
-            let square = i as Square;
-            let pos = &mut position.positions[piece.kind() as usize];
-            set_square(pos, square);
-            if piece != Piece::Empty {
-                set_square(&mut position.colors[piece.color() as usize], square);
-            }
-        }
-
-        position
-    }
-
-    pub fn piece_at(&self, square: Square) -> Piece {
-        self.by_piece[square as usize]
-    }
-
-    pub fn side_to_move(&self) -> Color {
-        self.side_to_move
-    }
-
-    fn occupied(&self) -> Bitboard {
-        self.colors[Color::White as usize] | self.colors[Color::Black as usize]
-    }
-
-    fn pieces(&self, color: Color, kind: PieceKind) -> Bitboard {
-        self.colors[color as usize] & self.positions[kind as usize]
-    }
-
-    fn king_square(&self, color: Color) -> Option<Square> {
-        let kings = self.pieces(color, PieceKind::King);
-        if kings == 0 {
-            None
-        } else {
-            Some(kings.trailing_zeros())
-        }
-    }
-
-    pub fn do_move(&mut self, m: Move) {
-        let origin = origin_square(m);
-        let destination = destination_square(m);
-
-        let moving_piece = self.by_piece[origin as usize];
-        assert!(moving_piece != Piece::Empty, "cannot move an empty square");
-        assert_eq!(
-            moving_piece.color(),
-            self.side_to_move,
-            "cannot move the opponent's piece"
-        );
-
-        let target_piece = self.by_piece[destination as usize];
-        assert!(
-            target_piece == Piece::Empty || target_piece.color() != self.side_to_move,
-            "cannot capture your own piece"
-        );
-
-        let us = self.side_to_move as usize;
-        let them = self.side_to_move.opposite() as usize;
-
-        unset_square(&mut self.colors[us], origin);
-        set_square(&mut self.colors[us], destination);
-        if target_piece != Piece::Empty {
-            unset_square(&mut self.colors[them], destination);
-        }
-
-        set_square(&mut self.positions[PieceKind::Empty as usize], origin);
-        let moving_piece_kind = moving_piece.kind() as usize;
-        let target_piece_kind = target_piece.kind() as usize;
-
-        unset_square(&mut self.positions[moving_piece_kind], origin);
-        unset_square(&mut self.positions[target_piece_kind], destination);
-
-        let destination_rank = destination / 8;
-        let moved_piece = if moving_piece.kind() == PieceKind::Pawn
-            && (destination_rank == 0 || destination_rank == 7)
-        {
-            Piece::from_kind_color(PieceKind::Queen, self.side_to_move)
-        } else {
-            moving_piece
-        };
-
-        set_square(
-            &mut self.positions[moved_piece.kind() as usize],
-            destination,
-        );
-
-        self.by_piece[destination as usize] = moved_piece;
-        self.by_piece[origin as usize] = Piece::Empty;
-        self.side_to_move = self.side_to_move.opposite();
-
-        assert!(self.is_consistent());
-    }
-
-    fn material(&self, color: Color) -> i32 {
-        let color_mask = self.colors[color as usize];
-
-        let mut value = 0;
-        value += (self.positions[PieceKind::Pawn as usize] & color_mask).count_ones() as i32 * 100;
-        value +=
-            (self.positions[PieceKind::Knight as usize] & color_mask).count_ones() as i32 * 320;
-        value +=
-            (self.positions[PieceKind::Bishop as usize] & color_mask).count_ones() as i32 * 330;
-        value += (self.positions[PieceKind::Rook as usize] & color_mask).count_ones() as i32 * 500;
-        value += (self.positions[PieceKind::Queen as usize] & color_mask).count_ones() as i32 * 900;
-        value +=
-            (self.positions[PieceKind::King as usize] & color_mask).count_ones() as i32 * 20000;
-        value
-    }
-
-    fn evaluate(&self) -> i32 {
-        self.material(self.side_to_move) - self.material(self.side_to_move.opposite())
-    }
-
-    fn is_consistent(&self) -> bool {
-        let occupied = self.occupied();
-        for i in 0..64 {
-            let piece = self.by_piece[i as usize];
-            let bb: u64 = 1u64 << i as u64;
-            if self.positions[piece.kind() as usize] & bb == 0 {
-                return false;
-            }
-            if piece != Piece::Empty {
-                let color = piece.color();
-                if self.colors[color as usize] & bb == 0 {
-                    return false;
-                }
-            } else if occupied & bb != 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn in_check(&self, color: Color) -> bool {
-        self.king_square(color)
-            .is_some_and(|square| is_square_attacked(self, square, color.opposite()))
-    }
+fn set_square(bitboard: &mut Bitboard, square: Square) {
+    *bitboard |= 1u64 << square;
 }
 
-#[derive(Copy, Clone)]
-struct Moves {
-    moves: [Move; 256],
-    num_moves: usize,
-}
-
-impl Moves {
-    fn new() -> Moves {
-        Moves {
-            moves: [0; 256],
-            num_moves: 0,
-        }
-    }
-
-    fn push(&mut self, m: Move) {
-        debug_assert!(self.num_moves < self.moves.len());
-        self.moves[self.num_moves] = m;
-        self.num_moves += 1;
-    }
-
-    fn iter(&self) -> MoveIter<'_> {
-        MoveIter {
-            moves: self,
-            idx: 0,
-        }
-    }
-
-    fn find(&self, origin: Square, destination: Square) -> Option<Move> {
-        self.iter()
-            .find(|m| origin_square(*m) == origin && destination_square(*m) == destination)
-    }
-}
-
-struct MoveIter<'a> {
-    moves: &'a Moves,
-    idx: usize,
-}
-
-impl<'a> Iterator for MoveIter<'a> {
-    type Item = Move;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.moves.num_moves {
-            return None;
-        }
-        let i = self.idx;
-        self.idx += 1;
-        Some(self.moves.moves[i])
-    }
-}
-
-pub fn create_move(origin: Square, destination: Square) -> Move {
-    let mut m = destination;
-    m |= origin << 6;
-    m
+fn unset_square(bitboard: &mut Bitboard, square: Square) {
+    *bitboard &= !(1u64 << square);
 }
 
 fn pop_square(board: &mut Bitboard) -> Square {
@@ -549,6 +458,555 @@ fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[Direction]) -
         attacks |= ray_attacks(bb, occupied, dir);
     }
     attacks
+}
+
+impl Position {
+    pub fn new() -> Position {
+        Position::from_board(INITIAL_PIECES, Color::White)
+    }
+
+    fn from_board(by_piece: [Piece; 64], side_to_move: Color) -> Position {
+        let mut position = Position {
+            positions: [0; 7],
+            colors: [0; 2],
+            by_piece,
+            side_to_move,
+            hash: 0,
+        };
+
+        for (i, piece) in position.by_piece.iter().copied().enumerate() {
+            let square = i as Square;
+            set_square(&mut position.positions[piece.kind() as usize], square);
+            if piece != Piece::Empty {
+                set_square(&mut position.colors[piece.color() as usize], square);
+                position.hash ^= piece_hash(piece, square);
+            }
+        }
+
+        if side_to_move == Color::Black {
+            position.hash ^= ZOBRIST_SIDE_TO_MOVE;
+        }
+
+        position
+    }
+
+    pub fn piece_at(&self, square: Square) -> Piece {
+        self.by_piece[square as usize]
+    }
+
+    pub fn side_to_move(&self) -> Color {
+        self.side_to_move
+    }
+
+    fn occupied(&self) -> Bitboard {
+        self.colors[Color::White as usize] | self.colors[Color::Black as usize]
+    }
+
+    fn pieces(&self, color: Color, kind: PieceKind) -> Bitboard {
+        self.colors[color as usize] & self.positions[kind as usize]
+    }
+
+    fn king_square(&self, color: Color) -> Option<Square> {
+        let kings = self.pieces(color, PieceKind::King);
+        if kings == 0 {
+            None
+        } else {
+            Some(kings.trailing_zeros())
+        }
+    }
+
+    fn remove_piece(&mut self, square: Square, piece: Piece) {
+        unset_square(&mut self.positions[piece.kind() as usize], square);
+        if piece != Piece::Empty {
+            unset_square(&mut self.colors[piece.color() as usize], square);
+            self.hash ^= piece_hash(piece, square);
+        }
+        self.by_piece[square as usize] = Piece::Empty;
+        set_square(&mut self.positions[PieceKind::Empty as usize], square);
+    }
+
+    fn add_piece(&mut self, square: Square, piece: Piece) {
+        unset_square(&mut self.positions[PieceKind::Empty as usize], square);
+        set_square(&mut self.positions[piece.kind() as usize], square);
+        if piece != Piece::Empty {
+            set_square(&mut self.colors[piece.color() as usize], square);
+            self.hash ^= piece_hash(piece, square);
+        }
+        self.by_piece[square as usize] = piece;
+    }
+
+    fn make_move_unchecked(&mut self, m: Move) -> Undo {
+        let origin = origin_square(m);
+        let destination = destination_square(m);
+        let moving_piece = self.by_piece[origin as usize];
+        let captured_piece = self.by_piece[destination as usize];
+        let destination_rank = destination / 8;
+        let placed_piece = if moving_piece.kind() == PieceKind::Pawn
+            && (destination_rank == 0 || destination_rank == 7)
+        {
+            Piece::from_kind_color(PieceKind::Queen, self.side_to_move)
+        } else {
+            moving_piece
+        };
+
+        self.remove_piece(origin, moving_piece);
+        if captured_piece != Piece::Empty {
+            self.remove_piece(destination, captured_piece);
+        }
+        self.add_piece(destination, placed_piece);
+
+        self.side_to_move = self.side_to_move.opposite();
+        self.hash ^= ZOBRIST_SIDE_TO_MOVE;
+
+        Undo {
+            moving_piece,
+            placed_piece,
+            captured_piece,
+        }
+    }
+
+    fn undo_move_unchecked(&mut self, m: Move, undo: Undo) {
+        let origin = origin_square(m);
+        let destination = destination_square(m);
+
+        self.side_to_move = self.side_to_move.opposite();
+        self.hash ^= ZOBRIST_SIDE_TO_MOVE;
+
+        self.remove_piece(destination, undo.placed_piece);
+        self.add_piece(origin, undo.moving_piece);
+        if undo.captured_piece != Piece::Empty {
+            self.add_piece(destination, undo.captured_piece);
+        }
+    }
+
+    pub fn do_move(&mut self, m: Move) {
+        let origin = origin_square(m);
+        let destination = destination_square(m);
+        let moving_piece = self.by_piece[origin as usize];
+        assert!(moving_piece != Piece::Empty, "cannot move an empty square");
+        assert_eq!(
+            moving_piece.color(),
+            self.side_to_move,
+            "cannot move the opponent's piece"
+        );
+
+        let target_piece = self.by_piece[destination as usize];
+        assert!(
+            target_piece == Piece::Empty || target_piece.color() != self.side_to_move,
+            "cannot capture your own piece"
+        );
+
+        let _ = self.make_move_unchecked(m);
+        assert!(self.is_consistent());
+    }
+
+    fn material(&self, color: Color) -> i32 {
+        let color_mask = self.colors[color as usize];
+
+        let mut value = 0;
+        value += (self.positions[PieceKind::Pawn as usize] & color_mask).count_ones() as i32 * 100;
+        value +=
+            (self.positions[PieceKind::Knight as usize] & color_mask).count_ones() as i32 * 320;
+        value +=
+            (self.positions[PieceKind::Bishop as usize] & color_mask).count_ones() as i32 * 330;
+        value += (self.positions[PieceKind::Rook as usize] & color_mask).count_ones() as i32 * 500;
+        value += (self.positions[PieceKind::Queen as usize] & color_mask).count_ones() as i32 * 900;
+        value +=
+            (self.positions[PieceKind::King as usize] & color_mask).count_ones() as i32 * 20000;
+        value
+    }
+
+    fn evaluate(&self) -> i32 {
+        self.material(self.side_to_move) - self.material(self.side_to_move.opposite())
+    }
+
+    fn is_consistent(&self) -> bool {
+        let occupied = self.occupied();
+        for square in 0..64 {
+            let piece = self.by_piece[square];
+            let bb = 1u64 << square as u64;
+            if self.positions[piece.kind() as usize] & bb == 0 {
+                return false;
+            }
+            if piece != Piece::Empty {
+                let color = piece.color();
+                if self.colors[color as usize] & bb == 0 {
+                    return false;
+                }
+            } else if occupied & bb != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn in_check(&self, color: Color) -> bool {
+        self.king_square(color)
+            .is_some_and(|square| is_square_attacked(self, square, color.opposite()))
+    }
+}
+
+impl Moves {
+    fn new() -> Moves {
+        Moves {
+            moves: [0; 256],
+            num_moves: 0,
+        }
+    }
+
+    fn push(&mut self, m: Move) {
+        debug_assert!(self.num_moves < self.moves.len());
+        self.moves[self.num_moves] = m;
+        self.num_moves += 1;
+    }
+
+    fn iter(&self) -> MoveIter<'_> {
+        MoveIter {
+            moves: self,
+            idx: 0,
+        }
+    }
+
+    fn find(&self, origin: Square, destination: Square) -> Option<Move> {
+        self.iter()
+            .find(|m| origin_square(*m) == origin && destination_square(*m) == destination)
+    }
+}
+
+impl<'a> Iterator for MoveIter<'a> {
+    type Item = Move;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx == self.moves.num_moves {
+            return None;
+        }
+
+        let idx = self.idx;
+        self.idx += 1;
+        Some(self.moves.moves[idx])
+    }
+}
+
+impl TranspositionTable {
+    fn new(size: usize) -> TranspositionTable {
+        assert!(size.is_power_of_two());
+        TranspositionTable {
+            entries: vec![TTEntry::default(); size],
+            mask: size - 1,
+        }
+    }
+
+    fn probe(&self, key: u64) -> Option<TTEntry> {
+        let entry = self.entries[key as usize & self.mask];
+        if entry.bound != Bound::Empty && entry.key == key {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    fn store(&mut self, key: u64, depth: usize, score: i32, bound: Bound, best_move: Move) {
+        let idx = key as usize & self.mask;
+        let current = self.entries[idx];
+        if current.bound == Bound::Empty || current.key != key || depth >= current.depth as usize {
+            self.entries[idx] = TTEntry {
+                key,
+                depth: depth as u8,
+                score,
+                best_move,
+                bound,
+            };
+        }
+    }
+}
+
+impl Searcher {
+    pub fn new() -> Searcher {
+        Searcher {
+            tt: TranspositionTable::new(TT_SIZE),
+        }
+    }
+
+    pub fn make_move(&mut self, position: &mut Position) -> bool {
+        let Some((best_move, _)) = self.best_move_with_time_budget(
+            position,
+            Duration::from_millis(SEARCH_TIME_BUDGET_MS as u64),
+        ) else {
+            return false;
+        };
+        position.do_move(best_move);
+        true
+    }
+
+    pub fn search_root_with_stats(
+        &mut self,
+        position: &Position,
+        depth: usize,
+    ) -> Option<SearchStats> {
+        let mut scratch = *position;
+        self.search_root(&mut scratch, depth, None)
+            .ok()
+            .flatten()
+            .map(|(_, stats)| stats)
+    }
+
+    pub fn best_move_with_time_budget(
+        &mut self,
+        position: &Position,
+        time_budget: Duration,
+    ) -> Option<(Move, SearchStats)> {
+        let mut scratch = *position;
+        let legal_moves = generate_legal_moves(&mut scratch);
+        match legal_moves.num_moves {
+            0 => return None,
+            1 => return Some((legal_moves.moves[0], SearchStats { nodes: 0, score: 0 })),
+            _ => {}
+        }
+
+        let deadline = Instant::now() + time_budget;
+        let mut best_completed = None;
+
+        for depth in 1..=MAX_SEARCH_DEPTH {
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            let mut scratch = *position;
+            match self.search_root(&mut scratch, depth, Some(deadline)) {
+                Ok(Some(result)) => best_completed = Some(result),
+                Ok(None) => return None,
+                Err(SearchAborted::Timeout) => break,
+            }
+        }
+
+        best_completed
+    }
+
+    fn search_root(
+        &mut self,
+        position: &mut Position,
+        depth: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Option<(Move, SearchStats)>, SearchAborted> {
+        let mut moves = generate_legal_moves(position);
+        if moves.num_moves == 0 {
+            return Ok(None);
+        }
+
+        let tt_move = self.tt.probe(position.hash).map(|entry| entry.best_move);
+        order_moves(position, &mut moves, tt_move);
+
+        let mut stats = SearchStats::default();
+        let mut best_move = moves.moves[0];
+        let mut best_score = -CHECKMATE_SCORE;
+        let mut alpha = -CHECKMATE_SCORE;
+        let beta = CHECKMATE_SCORE;
+
+        for m in moves.iter() {
+            if search_timed_out(deadline, stats.nodes) {
+                return Err(SearchAborted::Timeout);
+            }
+            let undo = position.make_move_unchecked(m);
+            let value = -self.negamax(
+                position,
+                depth.saturating_sub(1),
+                -beta,
+                -alpha,
+                &mut stats,
+                deadline,
+            )?;
+            position.undo_move_unchecked(m, undo);
+
+            if value > best_score {
+                best_score = value;
+                best_move = m;
+            }
+
+            if value > alpha {
+                alpha = value;
+            }
+        }
+
+        self.tt
+            .store(position.hash, depth, best_score, Bound::Exact, best_move);
+
+        stats.score = best_score;
+        Ok(Some((best_move, stats)))
+    }
+
+    fn negamax(
+        &mut self,
+        position: &mut Position,
+        depth: usize,
+        mut alpha: i32,
+        beta: i32,
+        stats: &mut SearchStats,
+        deadline: Option<Instant>,
+    ) -> Result<i32, SearchAborted> {
+        stats.nodes += 1;
+        if search_timed_out(deadline, stats.nodes) {
+            return Err(SearchAborted::Timeout);
+        }
+
+        let original_alpha = alpha;
+        if depth == 0 {
+            return Ok(position.evaluate());
+        }
+
+        let tt_entry = self.tt.probe(position.hash);
+        if let Some(entry) = tt_entry {
+            if entry.depth as usize >= depth {
+                match entry.bound {
+                    Bound::Exact => return Ok(entry.score),
+                    Bound::Lower => {
+                        if entry.score >= beta {
+                            return Ok(entry.score);
+                        }
+                        alpha = alpha.max(entry.score);
+                    }
+                    Bound::Upper => {
+                        if entry.score <= alpha {
+                            return Ok(entry.score);
+                        }
+                    }
+                    Bound::Empty => {}
+                }
+            }
+        }
+
+        let mut moves = generate_legal_moves(position);
+        if moves.num_moves == 0 {
+            return Ok(if position.in_check(position.side_to_move) {
+                -CHECKMATE_SCORE + depth as i32
+            } else {
+                0
+            });
+        }
+
+        order_moves(position, &mut moves, tt_entry.map(|entry| entry.best_move));
+
+        let mut best_value = -CHECKMATE_SCORE;
+        let mut best_move = 0;
+
+        for m in moves.iter() {
+            let undo = position.make_move_unchecked(m);
+            let value = -self.negamax(position, depth - 1, -beta, -alpha, stats, deadline)?;
+            position.undo_move_unchecked(m, undo);
+
+            if value > best_value {
+                best_value = value;
+                best_move = m;
+            }
+            if value > alpha {
+                alpha = value;
+            }
+            if alpha >= beta {
+                break;
+            }
+        }
+
+        let bound = if best_value <= original_alpha {
+            Bound::Upper
+        } else if best_value >= beta {
+            Bound::Lower
+        } else {
+            Bound::Exact
+        };
+
+        self.tt
+            .store(position.hash, depth, best_value, bound, best_move);
+        Ok(best_value)
+    }
+}
+
+impl Default for Searcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn create_move(origin: Square, destination: Square) -> Move {
+    let mut m = destination;
+    m |= origin << 6;
+    m
+}
+
+pub fn make_move(position: &mut Position) -> bool {
+    Searcher::new().make_move(position)
+}
+
+pub fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
+    let legal_moves = generate_legal_moves(position);
+    if let Some(m) = legal_moves.find(origin, destination) {
+        position.do_move(m);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn search_root_with_stats(position: &Position, depth: usize) -> Option<SearchStats> {
+    Searcher::new().search_root_with_stats(position, depth)
+}
+
+fn search_timed_out(deadline: Option<Instant>, nodes: u64) -> bool {
+    deadline.is_some_and(|limit| nodes % TIME_CHECK_INTERVAL == 0 && Instant::now() >= limit)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn piece_from_code(code: i32) -> Option<Piece> {
+    match code {
+        0 => Some(Piece::Empty),
+        1 => Some(Piece::WhitePawn),
+        2 => Some(Piece::BlackPawn),
+        3 => Some(Piece::WhiteKnight),
+        4 => Some(Piece::BlackKnight),
+        5 => Some(Piece::WhiteBishop),
+        6 => Some(Piece::BlackBishop),
+        7 => Some(Piece::WhiteRook),
+        8 => Some(Piece::BlackRook),
+        9 => Some(Piece::WhiteQueen),
+        10 => Some(Piece::BlackQueen),
+        11 => Some(Piece::WhiteKing),
+        12 => Some(Piece::BlackKing),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn color_from_code(code: u8) -> Option<Color> {
+    match code {
+        0 => Some(Color::White),
+        1 => Some(Color::Black),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn search_best_move(board: Vec<i32>, side_to_move: u8, time_budget_ms: u32) -> i32 {
+    if board.len() != 64 {
+        return -1;
+    }
+
+    let Some(side_to_move) = color_from_code(side_to_move) else {
+        return -1;
+    };
+
+    let mut pieces = [Piece::Empty; 64];
+    for (idx, code) in board.into_iter().enumerate() {
+        let Some(piece) = piece_from_code(code) else {
+            return -1;
+        };
+        pieces[idx] = piece;
+    }
+
+    let position = Position::from_board(pieces, side_to_move);
+    let mut searcher = Searcher::new();
+    searcher
+        .best_move_with_time_budget(&position, Duration::from_millis(time_budget_ms as u64))
+        .map(|(best_move, _)| best_move as i32)
+        .unwrap_or(-1)
 }
 
 fn get_attacks(from: Square, position: &Position, piece_kind: PieceKind) -> Bitboard {
@@ -689,15 +1147,17 @@ fn is_square_attacked(position: &Position, square: Square, attacker: Color) -> b
     )
 }
 
-fn generate_legal_moves(position: &Position) -> Moves {
+fn generate_legal_moves(position: &mut Position) -> Moves {
     let pseudo_legal_moves = generate_pseudo_legal_moves(position);
     let mut legal_moves = Moves::new();
     let side_to_move = position.side_to_move;
 
     for m in pseudo_legal_moves.iter() {
-        let mut next = *position;
-        next.do_move(m);
-        if !next.in_check(side_to_move) {
+        let undo = position.make_move_unchecked(m);
+        let is_legal = !position.in_check(side_to_move);
+        position.undo_move_unchecked(m, undo);
+
+        if is_legal {
             legal_moves.push(m);
         }
     }
@@ -705,142 +1165,47 @@ fn generate_legal_moves(position: &Position) -> Moves {
     legal_moves
 }
 
-fn negamax(position: &Position, depth: usize, mut alpha: i32, beta: i32) -> i32 {
-    if depth == 0 {
-        return position.evaluate();
+fn move_score(position: &Position, m: Move, tt_move: Option<Move>) -> i32 {
+    if tt_move.is_some_and(|candidate| candidate == m) {
+        return i32::MAX;
     }
 
-    let moves = generate_legal_moves(position);
-    if moves.num_moves == 0 {
-        return if position.in_check(position.side_to_move) {
-            -CHECKMATE_SCORE + depth as i32
-        } else {
-            0
-        };
-    }
+    let origin = origin_square(m);
+    let destination = destination_square(m);
+    let moving_piece = position.by_piece[origin as usize];
+    let captured_piece = position.by_piece[destination as usize];
 
-    let mut best_value = -CHECKMATE_SCORE;
-    for m in moves.iter() {
-        let mut next = *position;
-        next.do_move(m);
-        let value = -negamax(&next, depth - 1, -beta, -alpha);
-        if value > best_value {
-            best_value = value;
-        }
-        if value > alpha {
-            alpha = value;
-        }
-        if alpha >= beta {
-            break;
-        }
+    let mut score = 0;
+    if captured_piece != Piece::Empty {
+        score += 10_000;
+        score += piece_value(captured_piece.kind()) * 16 - piece_value(moving_piece.kind());
     }
-
-    best_value
+    if moving_piece.kind() == PieceKind::Pawn && (destination / 8 == 0 || destination / 8 == 7) {
+        score += 8_000;
+    }
+    score
 }
 
-fn negamax_with_stats(
-    position: &Position,
-    depth: usize,
-    mut alpha: i32,
-    beta: i32,
-    stats: &mut SearchStats,
-) -> i32 {
-    stats.nodes += 1;
-
-    if depth == 0 {
-        return position.evaluate();
+fn order_moves(position: &Position, moves: &mut Moves, tt_move: Option<Move>) {
+    let mut scores = [0; 256];
+    for idx in 0..moves.num_moves {
+        scores[idx] = move_score(position, moves.moves[idx], tt_move);
     }
 
-    let moves = generate_legal_moves(position);
-    if moves.num_moves == 0 {
-        return if position.in_check(position.side_to_move) {
-            -CHECKMATE_SCORE + depth as i32
-        } else {
-            0
-        };
-    }
+    for i in 1..moves.num_moves {
+        let move_to_insert = moves.moves[i];
+        let score_to_insert = scores[i];
+        let mut j = i;
 
-    let mut best_value = -CHECKMATE_SCORE;
-    for m in moves.iter() {
-        let mut next = *position;
-        next.do_move(m);
-        let value = -negamax_with_stats(&next, depth - 1, -beta, -alpha, stats);
-        if value > best_value {
-            best_value = value;
+        while j > 0 && score_to_insert > scores[j - 1] {
+            moves.moves[j] = moves.moves[j - 1];
+            scores[j] = scores[j - 1];
+            j -= 1;
         }
-        if value > alpha {
-            alpha = value;
-        }
-        if alpha >= beta {
-            break;
-        }
+
+        moves.moves[j] = move_to_insert;
+        scores[j] = score_to_insert;
     }
-
-    best_value
-}
-
-pub fn make_move(position: &mut Position) -> bool {
-    let moves = generate_legal_moves(position);
-    if moves.num_moves == 0 {
-        return false;
-    }
-
-    let mut best_move = moves.moves[0];
-    let mut best_value = -CHECKMATE_SCORE;
-    for m in moves.iter() {
-        let mut next = *position;
-        next.do_move(m);
-        let value = -negamax(
-            &next,
-            SEARCH_DEPTH.saturating_sub(1),
-            -CHECKMATE_SCORE,
-            CHECKMATE_SCORE,
-        );
-        if value > best_value {
-            best_move = m;
-            best_value = value;
-        }
-    }
-
-    position.do_move(best_move);
-    true
-}
-
-pub fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
-    let legal_moves = generate_legal_moves(position);
-    if let Some(m) = legal_moves.find(origin, destination) {
-        position.do_move(m);
-        return true;
-    }
-    false
-}
-
-pub fn search_root_with_stats(position: &Position, depth: usize) -> Option<SearchStats> {
-    let moves = generate_legal_moves(position);
-    if moves.num_moves == 0 {
-        return None;
-    }
-
-    let mut stats = SearchStats::default();
-    let mut best_score = -CHECKMATE_SCORE;
-
-    for m in moves.iter() {
-        let mut next = *position;
-        next.do_move(m);
-        let value = -negamax_with_stats(
-            &next,
-            depth.saturating_sub(1),
-            -CHECKMATE_SCORE,
-            CHECKMATE_SCORE,
-            &mut stats,
-        );
-        if value > best_score {
-            best_score = value;
-        }
-    }
-
-    stats.score = best_score;
-    Some(stats)
 }
 
 #[cfg(test)]
@@ -857,8 +1222,8 @@ mod tests {
 
     #[test]
     fn initial_position_has_twenty_legal_moves() {
-        let position = Position::new();
-        assert_eq!(generate_legal_moves(&position).num_moves, 20);
+        let mut position = Position::new();
+        assert_eq!(generate_legal_moves(&mut position).num_moves, 20);
     }
 
     #[test]
@@ -875,8 +1240,8 @@ mod tests {
 
     #[test]
     fn blocked_rook_move_is_not_legal() {
-        let position = Position::new();
-        assert!(generate_legal_moves(&position).find(0, 16).is_none());
+        let mut position = Position::new();
+        assert!(generate_legal_moves(&mut position).find(0, 16).is_none());
     }
 
     #[test]
@@ -904,6 +1269,7 @@ mod tests {
 
     #[test]
     fn engine_prefers_the_winning_capture() {
+        let mut searcher = Searcher::new();
         let mut position = board_with(
             &[
                 (7, Piece::WhiteKing),
@@ -915,8 +1281,24 @@ mod tests {
         );
 
         assert!(position.in_check(Color::White));
-        assert!(make_move(&mut position));
+        assert!(searcher.make_move(&mut position));
         assert_eq!(position.by_piece[56], Piece::WhiteRook);
         assert_eq!(position.by_piece[0], Piece::Empty);
+    }
+
+    #[test]
+    fn make_unmake_restores_hash_and_board() {
+        let mut position = Position::new();
+        let original = position;
+        let m = create_move(12, 28);
+
+        let undo = position.make_move_unchecked(m);
+        position.undo_move_unchecked(m, undo);
+
+        assert_eq!(position.hash, original.hash);
+        for square in 0..64 {
+            assert_eq!(position.piece_at(square), original.piece_at(square));
+        }
+        assert_eq!(position.side_to_move(), original.side_to_move());
     }
 }

@@ -1,4 +1,4 @@
-use onion::engine::{create_move, search_root_with_stats, Position};
+use onion::engine::{create_move, Position, Searcher};
 use std::{env, process, time::Instant};
 
 fn opening_position() -> Position {
@@ -17,8 +17,9 @@ fn benchmark_position(name: &str, position: &Position, max_depth: usize, max_sec
     println!("position: {name}");
 
     for depth in 1..=max_depth {
+        let mut searcher = Searcher::new();
         let start = Instant::now();
-        let stats = search_root_with_stats(position, depth);
+        let stats = searcher.search_root_with_stats(position, depth);
         let elapsed = start.elapsed();
         let seconds = elapsed.as_secs_f64();
 
