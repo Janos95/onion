@@ -77,28 +77,29 @@ const INITIAL_PIECES: [Piece; 64] = [
 
 const SEARCH_DEPTH: usize = 3;
 const CHECKMATE_SCORE: i32 = 100_000;
-const KNIGHT_DELTAS: [(i32, i32); 8] = [
-    (2, 1),
-    (2, -1),
-    (1, 2),
-    (1, -2),
-    (-1, 2),
-    (-1, -2),
-    (-2, 1),
-    (-2, -1),
+const FILE_MASKS: [Bitboard; 8] = [
+    0x0101010101010101,
+    0x0202020202020202,
+    0x0404040404040404,
+    0x0808080808080808,
+    0x1010101010101010,
+    0x2020202020202020,
+    0x4040404040404040,
+    0x8080808080808080,
 ];
-const KING_DELTAS: [(i32, i32); 8] = [
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-    (0, -1),
-    (1, -1),
+const RANK_MASKS: [Bitboard; 8] = [
+    0x00000000000000FF,
+    0x000000000000FF00,
+    0x0000000000FF0000,
+    0x00000000FF000000,
+    0x000000FF00000000,
+    0x0000FF0000000000,
+    0x00FF000000000000,
+    0xFF00000000000000,
 ];
-const BISHOP_DIRECTIONS: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-const ROOK_DIRECTIONS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const FILE_ABB: Bitboard = FILE_MASKS[0];
+const FILE_HBB: Bitboard = FILE_MASKS[7];
+const DOUBLE_PUSH_MASK: [Bitboard; 2] = [RANK_MASKS[2], RANK_MASKS[5]];
 
 // chess colors
 #[repr(u8)]
@@ -202,6 +203,42 @@ type Square = u32;
 
 /// bits 0-5: destination square, bits 6-11: origin square
 type Move = u32;
+
+#[repr(i32)]
+#[derive(Copy, Clone)]
+enum Direction {
+    North = 8,
+    East = 1,
+    South = -8,
+    West = -1,
+    NorthEast = 9,
+    SouthEast = -7,
+    SouthWest = -9,
+    NorthWest = 7,
+}
+
+const BISHOP_DIRECTIONS: [Direction; 4] = [
+    Direction::NorthEast,
+    Direction::NorthWest,
+    Direction::SouthEast,
+    Direction::SouthWest,
+];
+const ROOK_DIRECTIONS: [Direction; 4] = [
+    Direction::North,
+    Direction::East,
+    Direction::South,
+    Direction::West,
+];
+const KING_DIRECTIONS: [Direction; 8] = [
+    Direction::North,
+    Direction::NorthEast,
+    Direction::East,
+    Direction::SouthEast,
+    Direction::South,
+    Direction::SouthWest,
+    Direction::West,
+    Direction::NorthWest,
+];
 
 fn destination_square(m: Move) -> Square {
     return m & 0x3F;
@@ -443,62 +480,92 @@ fn to_bb(s: Square) -> Bitboard {
     1u64 << s
 }
 
-fn file_of(square: Square) -> i32 {
-    (square % 8) as i32
-}
-
-fn rank_of(square: Square) -> i32 {
-    (square / 8) as i32
-}
-
-fn square_from_coords(file: i32, rank: i32) -> Option<Square> {
-    if !(0..8).contains(&file) || !(0..8).contains(&rank) {
-        return None;
+fn shift(bb: Bitboard, dir: Direction) -> Bitboard {
+    match dir {
+        Direction::North => bb << 8,
+        Direction::South => bb >> 8,
+        Direction::East => (bb & !FILE_HBB) << 1,
+        Direction::West => (bb & !FILE_ABB) >> 1,
+        Direction::NorthEast => (bb & !FILE_HBB) << 9,
+        Direction::NorthWest => (bb & !FILE_ABB) << 7,
+        Direction::SouthEast => (bb & !FILE_HBB) >> 7,
+        Direction::SouthWest => (bb & !FILE_ABB) >> 9,
     }
-    Some((rank * 8 + file) as Square)
 }
 
-// The position stays bitboard-backed; file/rank stepping here is just the simplest
-// correct way to cover all piece types without introducing separate attack tables.
-fn jump_attacks(from: Square, deltas: &[(i32, i32)]) -> Bitboard {
-    let file = file_of(from);
-    let rank = rank_of(from);
+fn pawn_push(color: Color) -> Direction {
+    match color {
+        Color::White => Direction::North,
+        Color::Black => Direction::South,
+    }
+}
+
+fn pawn_capture_directions(color: Color) -> [Direction; 2] {
+    match color {
+        Color::White => [Direction::NorthWest, Direction::NorthEast],
+        Color::Black => [Direction::SouthWest, Direction::SouthEast],
+    }
+}
+
+fn knight_attacks(from: Square) -> Bitboard {
+    let bb = to_bb(from);
+    shift(shift(bb, Direction::North), Direction::NorthEast)
+        | shift(shift(bb, Direction::North), Direction::NorthWest)
+        | shift(shift(bb, Direction::South), Direction::SouthEast)
+        | shift(shift(bb, Direction::South), Direction::SouthWest)
+        | shift(shift(bb, Direction::East), Direction::NorthEast)
+        | shift(shift(bb, Direction::East), Direction::SouthEast)
+        | shift(shift(bb, Direction::West), Direction::NorthWest)
+        | shift(shift(bb, Direction::West), Direction::SouthWest)
+}
+
+fn king_attacks(from: Square) -> Bitboard {
+    let bb = to_bb(from);
     let mut attacks = 0;
-    for (df, dr) in deltas {
-        if let Some(square) = square_from_coords(file + df, rank + dr) {
-            attacks |= to_bb(square);
-        }
+    for dir in KING_DIRECTIONS {
+        attacks |= shift(bb, dir);
     }
     attacks
 }
 
-fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[(i32, i32)]) -> Bitboard {
+fn ray_attacks(from: Bitboard, occupied: Bitboard, dir: Direction) -> Bitboard {
     let mut attacks = 0;
-    for (df, dr) in directions {
-        let mut file = file_of(from) + df;
-        let mut rank = rank_of(from) + dr;
-        while let Some(square) = square_from_coords(file, rank) {
-            attacks |= to_bb(square);
-            if occupied & to_bb(square) != 0 {
-                break;
-            }
-            file += df;
-            rank += dr;
+    let mut current = from;
+
+    loop {
+        current = shift(current, dir);
+        if current == 0 {
+            break;
         }
+
+        attacks |= current;
+        if current & occupied != 0 {
+            break;
+        }
+    }
+
+    attacks
+}
+
+fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[Direction]) -> Bitboard {
+    let mut attacks = 0;
+    let bb = to_bb(from);
+    for &dir in directions {
+        attacks |= ray_attacks(bb, occupied, dir);
     }
     attacks
 }
 
 fn get_attacks(from: Square, position: &Position, piece_kind: PieceKind) -> Bitboard {
     match piece_kind {
-        PieceKind::Knight => jump_attacks(from, &KNIGHT_DELTAS),
+        PieceKind::Knight => knight_attacks(from),
         PieceKind::Bishop => sliding_attacks(from, position.occupied(), &BISHOP_DIRECTIONS),
         PieceKind::Rook => sliding_attacks(from, position.occupied(), &ROOK_DIRECTIONS),
         PieceKind::Queen => {
             sliding_attacks(from, position.occupied(), &BISHOP_DIRECTIONS)
                 | sliding_attacks(from, position.occupied(), &ROOK_DIRECTIONS)
         }
-        PieceKind::King => jump_attacks(from, &KING_DELTAS),
+        PieceKind::King => king_attacks(from),
         PieceKind::Empty | PieceKind::Pawn => 0,
     }
 }
@@ -521,39 +588,43 @@ fn generate_piece_moves(position: &Position, moves: &mut Moves, piece_kind: Piec
 fn generate_pawn_moves(position: &Position, moves: &mut Moves) {
     let us = position.side_to_move;
     let them = us.opposite();
-    let occupied = position.occupied();
+    let up = pawn_push(us);
+    let [up_left, up_right] = pawn_capture_directions(us);
+    let empty = position.positions[PieceKind::Empty as usize];
+    let pawns = position.pieces(us, PieceKind::Pawn);
     let enemy_king = position.pieces(them, PieceKind::King);
     let enemy_pieces = position.colors[them as usize] & !enemy_king;
-    let forward = if us == Color::White { 1 } else { -1 };
-    let start_rank = if us == Color::White { 1 } else { 6 };
-    let mut pawns = position.pieces(us, PieceKind::Pawn);
+    let direction_offset = |dir: Direction| dir as i32;
 
-    while pawns != 0 {
-        let from = pop_square(&mut pawns);
-        let file = file_of(from);
-        let rank = rank_of(from);
+    let mut single_pushes = shift(pawns, up) & empty;
+    while single_pushes != 0 {
+        let destination = pop_square(&mut single_pushes);
+        let origin = (destination as i32 - direction_offset(up)) as Square;
+        moves.push(create_move(origin, destination));
+    }
 
-        if let Some(destination) = square_from_coords(file, rank + forward) {
-            if occupied & to_bb(destination) == 0 {
-                moves.push(create_move(from, destination));
+    let mut double_pushes = shift(
+        (shift(pawns, up) & empty) & DOUBLE_PUSH_MASK[us as usize],
+        up,
+    ) & empty;
+    while double_pushes != 0 {
+        let destination = pop_square(&mut double_pushes);
+        let origin = (destination as i32 - 2 * direction_offset(up)) as Square;
+        moves.push(create_move(origin, destination));
+    }
 
-                if rank == start_rank {
-                    if let Some(double_destination) = square_from_coords(file, rank + 2 * forward) {
-                        if occupied & to_bb(double_destination) == 0 {
-                            moves.push(create_move(from, double_destination));
-                        }
-                    }
-                }
-            }
-        }
+    let mut left_captures = shift(pawns, up_left) & enemy_pieces;
+    while left_captures != 0 {
+        let destination = pop_square(&mut left_captures);
+        let origin = (destination as i32 - direction_offset(up_left)) as Square;
+        moves.push(create_move(origin, destination));
+    }
 
-        for file_delta in [-1, 1] {
-            if let Some(destination) = square_from_coords(file + file_delta, rank + forward) {
-                if enemy_pieces & to_bb(destination) != 0 {
-                    moves.push(create_move(from, destination));
-                }
-            }
-        }
+    let mut right_captures = shift(pawns, up_right) & enemy_pieces;
+    while right_captures != 0 {
+        let destination = pop_square(&mut right_captures);
+        let origin = (destination as i32 - direction_offset(up_right)) as Square;
+        moves.push(create_move(origin, destination));
     }
 }
 
@@ -571,57 +642,41 @@ fn generate_pseudo_legal_moves(position: &Position) -> Moves {
 fn slider_attacks_square(
     position: &Position,
     square: Square,
-    attacker: Color,
-    directions: &[(i32, i32)],
-    primary: PieceKind,
-    secondary: PieceKind,
+    pieces: Bitboard,
+    directions: &[Direction],
 ) -> bool {
-    for (df, dr) in directions {
-        let mut file = file_of(square) + df;
-        let mut rank = rank_of(square) + dr;
+    let target = to_bb(square);
+    let occupied = position.occupied();
+    let mut pieces = pieces;
 
-        while let Some(candidate) = square_from_coords(file, rank) {
-            let piece = position.by_piece[candidate as usize];
-            if piece != Piece::Empty {
-                if piece.color() == attacker
-                    && (piece.kind() == primary || piece.kind() == secondary)
-                {
-                    return true;
-                }
-                break;
-            }
-
-            file += df;
-            rank += dr;
+    while pieces != 0 {
+        let from = pop_square(&mut pieces);
+        if sliding_attacks(from, occupied, directions) & target != 0 {
+            return true;
         }
     }
+
     false
 }
 
 fn is_square_attacked(position: &Position, square: Square, attacker: Color) -> bool {
     let target = to_bb(square);
-    let pawn_rank = rank_of(square) + if attacker == Color::White { -1 } else { 1 };
-
-    for file_delta in [-1, 1] {
-        if let Some(candidate) = square_from_coords(file_of(square) + file_delta, pawn_rank) {
-            let piece = position.by_piece[candidate as usize];
-            if piece != Piece::Empty && piece.color() == attacker && piece.kind() == PieceKind::Pawn
-            {
-                return true;
-            }
-        }
+    let pawns = position.pieces(attacker, PieceKind::Pawn);
+    let [up_left, up_right] = pawn_capture_directions(attacker);
+    if (shift(pawns, up_left) | shift(pawns, up_right)) & target != 0 {
+        return true;
     }
 
     let mut knights = position.pieces(attacker, PieceKind::Knight);
     while knights != 0 {
         let from = pop_square(&mut knights);
-        if jump_attacks(from, &KNIGHT_DELTAS) & target != 0 {
+        if knight_attacks(from) & target != 0 {
             return true;
         }
     }
 
     if let Some(king_square) = position.king_square(attacker) {
-        if jump_attacks(king_square, &KING_DELTAS) & target != 0 {
+        if king_attacks(king_square) & target != 0 {
             return true;
         }
     }
@@ -629,17 +684,13 @@ fn is_square_attacked(position: &Position, square: Square, attacker: Color) -> b
     slider_attacks_square(
         position,
         square,
-        attacker,
+        position.pieces(attacker, PieceKind::Bishop) | position.pieces(attacker, PieceKind::Queen),
         &BISHOP_DIRECTIONS,
-        PieceKind::Bishop,
-        PieceKind::Queen,
     ) || slider_attacks_square(
         position,
         square,
-        attacker,
+        position.pieces(attacker, PieceKind::Rook) | position.pieces(attacker, PieceKind::Queen),
         &ROOK_DIRECTIONS,
-        PieceKind::Rook,
-        PieceKind::Queen,
     )
 }
 

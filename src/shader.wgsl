@@ -292,9 +292,7 @@ fn dispatch_piece(p : v2, square_id : i32) -> f32 {
 
 @fragment
 fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
-    // Vertices emit exact 1.0 texcoords on the top/right edge; clamp them into the
-    // last board cell so trunc() cannot produce i/j == 8 and index past square 63.
-    let uv = clamp(vertex.tex_coord, v2(0.0), v2(0.99999994));
+    let uv = vertex.tex_coord;
     let a = 1. / 8.;
     let x = uv.x / a;
     let y = uv.y / a;
