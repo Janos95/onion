@@ -458,6 +458,8 @@ fn square_from_coords(file: i32, rank: i32) -> Option<Square> {
     Some((rank * 8 + file) as Square)
 }
 
+// The position stays bitboard-backed; file/rank stepping here is just the simplest
+// correct way to cover all piece types without introducing separate attack tables.
 fn jump_attacks(from: Square, deltas: &[(i32, i32)]) -> Bitboard {
     let file = file_of(from);
     let rank = rank_of(from);
