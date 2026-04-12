@@ -292,7 +292,7 @@ fn dispatch_piece(p : v2, square_id : i32) -> f32 {
 
 @fragment
 fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
-    let uv = vertex.tex_coord;
+    let uv = clamp(vertex.tex_coord, v2(0.0), v2(0.99999994));
     let a = 1. / 8.;
     let x = uv.x / a;
     let y = uv.y / a;
@@ -325,4 +325,3 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     col = mix(col, vec3(0.0), 1.0-smoothstep(0.0,0.03,abs(d)) );
     return v4(col.x, col.y, col.z, 1.);
 }
-
