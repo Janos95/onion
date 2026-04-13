@@ -1291,6 +1291,28 @@ pub fn create_move(origin: Square, destination: Square) -> Move {
     create_flagged_move(origin, destination, MoveFlag::Quiet)
 }
 
+pub fn is_selectable_piece(position: &Position, square: Square) -> bool {
+    let piece = position.piece_at(square);
+    piece != Piece::Empty && piece.color() == position.side_to_move()
+}
+
+pub fn legal_move_destinations(position: &Position, origin: Square) -> u64 {
+    if !is_selectable_piece(position, origin) {
+        return 0;
+    }
+
+    let mut scratch = *position;
+    let legal_moves = generate_legal_moves(&mut scratch);
+    let mut destinations = 0u64;
+    for m in legal_moves.iter() {
+        if origin_square(m) == origin {
+            destinations |= to_bb(destination_square(m));
+        }
+    }
+
+    destinations
+}
+
 pub fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
     let legal_moves = generate_legal_moves(position);
     if let Some(m) = legal_moves.find(origin, destination) {

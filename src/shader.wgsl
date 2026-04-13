@@ -4,6 +4,7 @@ alias v4 = vec4<f32>;
 
 struct uniforms {
     pieces: array<vec4<i32>, 16>,
+    markers: array<vec4<i32>, 16>,
     status: vec4<f32>,
 };
 
@@ -277,6 +278,10 @@ fn piece_color(square_id : i32) -> v3 {
     return pow(v3(248.,248.,248.) / 255., v3(2.2));
 }
 
+fn square_marker(square_id : i32) -> i32 {
+    return state.markers[square_id / 4][square_id % 4];
+}
+
 fn square_color(i : i32, j : i32) -> v3 {
     let is_white = ((i + j) % 2) == 0;
     if is_white {
@@ -326,7 +331,14 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let d = dispatch_piece(p, square_id);
     let piece = state.pieces[square_id / 4][square_id % 4];
     let is_black_piece = piece != 0 && (piece & 1) == 0;
+    let marker = square_marker(square_id);
+    let is_selected_piece = marker == 2;
     let square = square_color(i, j);
+    let selected_outline = pow(v3(207., 158., 84.) / 255., v3(2.2));
+    let move_disk = pow(v3(150., 150., 150.) / 255., v3(2.2));
+    let disk_distance = length(p) - 0.2;
+    let disk_aa = max(fwidth(disk_distance), 0.002);
+    let disk_strength = 1.0 - smoothstep(0.0, disk_aa, disk_distance);
     var col : v3;
     if d < 0.0 {
         col = piece_color(square_id);
@@ -338,7 +350,14 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     else {
         col = square;
     }
-    col = mix(col, vec3(0.0), 1.0-smoothstep(0.0,0.03,abs(d)) );
+
+    if marker == 1 {
+        let disk_alpha = select(0.9, 0.65, piece != 0);
+        col = mix(col, move_disk, disk_strength * disk_alpha);
+    }
+
+    let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
+    col = mix(col, outline_color, 1.0 - smoothstep(0.0, 0.03, abs(d)));
 
     return v4(col.x, col.y, col.z, 1.);
 }

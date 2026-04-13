@@ -1,5 +1,8 @@
 use bytemuck::{Pod, Zeroable};
-use onion::engine::{try_player_move, Move, Position, Square, SEARCH_TIME_BUDGET_MS};
+use onion::engine::{
+    is_selectable_piece, legal_move_destinations, try_player_move, Move, Position, Square,
+    SEARCH_TIME_BUDGET_MS,
+};
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -46,6 +49,7 @@ fn mouse_to_square(
 #[derive(Debug, Copy, Clone)]
 struct GpuState {
     pieces: [i32; 64],
+    markers: [i32; 64],
     status: [f32; 4],
 }
 
@@ -53,9 +57,16 @@ unsafe impl Zeroable for GpuState {}
 unsafe impl Pod for GpuState {}
 
 impl GpuState {
-    fn new(position: &Position, engine_is_thinking: bool, animation_time_seconds: f32) -> GpuState {
+    fn new(
+        position: &Position,
+        selected_square: Option<Square>,
+        legal_move_destinations: u64,
+        engine_is_thinking: bool,
+        animation_time_seconds: f32,
+    ) -> GpuState {
         let mut board = GpuState {
             pieces: [0; 64],
+            markers: [0; 64],
             status: [
                 if engine_is_thinking { 1.0 } else { 0.0 },
                 animation_time_seconds,
@@ -65,6 +76,12 @@ impl GpuState {
         };
         for square in 0..64 {
             board.pieces[square] = position.piece_at(square as Square) as i32;
+            if (legal_move_destinations & (1u64 << square)) != 0 {
+                board.markers[square] = 1;
+            }
+        }
+        if let Some(square) = selected_square {
+            board.markers[square as usize] = 2;
         }
         board
     }
@@ -88,10 +105,18 @@ fn write_gpu_state(
     queue: &wgpu::Queue,
     uniform_buf: &wgpu::Buffer,
     position: &Position,
+    selected_square: Option<Square>,
+    legal_move_destinations: u64,
     engine_is_thinking: bool,
     animation_time_seconds: f32,
 ) {
-    let gpu_state = GpuState::new(position, engine_is_thinking, animation_time_seconds);
+    let gpu_state = GpuState::new(
+        position,
+        selected_square,
+        legal_move_destinations,
+        engine_is_thinking,
+        animation_time_seconds,
+    );
     queue.write_buffer(uniform_buf, 0, gpu_state.as_byte_slice());
 }
 
@@ -425,7 +450,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
 
     let engine_driver = EngineDriver::new(event_loop.create_proxy());
     let mut position = Position::new();
-    let gpu_state = GpuState::new(&position, false, 0.0);
+    let gpu_state = GpuState::new(&position, None, 0, false, 0.0);
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Uniform Buffer"),
@@ -501,9 +526,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let animation_loop = AnimationLoop::new(event_loop.create_proxy());
 
     let mut current_mouse_pos = None;
-    let mut mouse_index = 0;
-    let mut mouse_positions = [PhysicalPosition::default(); 2];
-    let mut pending_move_selection = false;
+    let mut selected_square = None;
+    let mut selected_moves_mask = 0u64;
     let mut engine_is_thinking = false;
     let mut thinking_started_time_seconds = 0.0f32;
     let mut active_request_id = 0u32;
@@ -537,6 +561,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         &queue,
                         &uniform_buf,
                         &position,
+                        selected_square,
+                        selected_moves_mask,
                         engine_is_thinking,
                         thinking_elapsed,
                     );
@@ -552,6 +578,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         &queue,
                         &uniform_buf,
                         &position,
+                        selected_square,
+                        selected_moves_mask,
                         engine_is_thinking,
                         thinking_elapsed,
                     );
@@ -567,6 +595,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 }
 
                 engine_is_thinking = false;
+                selected_square = None;
+                selected_moves_mask = 0;
                 #[cfg(target_arch = "wasm32")]
                 animation_loop.stop();
                 if let Some(best_move) = best_move {
@@ -576,6 +606,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                     &queue,
                     &uniform_buf,
                     &position,
+                    selected_square,
+                    selected_moves_mask,
                     engine_is_thinking,
                     0.0,
                 );
@@ -596,23 +628,27 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 event: WindowEvent::MouseInput { button, state, .. },
                 ..
             } => {
-                if button == MouseButton::Left && !engine_is_thinking {
-                    if state == winit::event::ElementState::Released {
-                        if let Some(mouse_pos) = current_mouse_pos {
-                            mouse_positions[mouse_index] = mouse_pos;
-                            pending_move_selection = mouse_index == 1;
-                            mouse_index = (mouse_index + 1) % 2;
-                        }
-                    }
+                if button == MouseButton::Left
+                    && state == winit::event::ElementState::Released
+                    && !engine_is_thinking
+                {
+                    let window_size = window.inner_size();
+                    let clicked_square =
+                        current_mouse_pos.and_then(|mouse_pos| mouse_to_square(mouse_pos, window_size));
 
-                    if pending_move_selection {
-                        pending_move_selection = false;
-                        let window_size = window.inner_size();
-                        if let (Some(from), Some(to)) = (
-                            mouse_to_square(mouse_positions[0], window_size),
-                            mouse_to_square(mouse_positions[1], window_size),
-                        ) {
-                            if try_player_move(&mut position, from, to) {
+                    if let Some(clicked_square) = clicked_square {
+                        if selected_square == Some(clicked_square) {
+                            selected_square = None;
+                            selected_moves_mask = 0;
+                        } else if is_selectable_piece(&position, clicked_square) {
+                            selected_square = Some(clicked_square);
+                            selected_moves_mask = legal_move_destinations(&position, clicked_square);
+                        } else if let Some(from) = selected_square {
+                            if (selected_moves_mask & (1u64 << clicked_square)) != 0
+                                && try_player_move(&mut position, from, clicked_square)
+                            {
+                                selected_square = None;
+                                selected_moves_mask = 0;
                                 engine_is_thinking = true;
                                 // Reset the pulse phase so black pieces always start fully opaque.
                                 thinking_started_time_seconds =
@@ -624,6 +660,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                                     &queue,
                                     &uniform_buf,
                                     &position,
+                                    selected_square,
+                                    selected_moves_mask,
                                     engine_is_thinking,
                                     0.0,
                                 );
@@ -631,8 +669,20 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                                 #[cfg(target_arch = "wasm32")]
                                 sync_debug_state(&position, engine_is_thinking, active_request_id);
                                 engine_driver.request_move(active_request_id, position);
+                                return;
                             }
                         }
+
+                        write_gpu_state(
+                            &queue,
+                            &uniform_buf,
+                            &position,
+                            selected_square,
+                            selected_moves_mask,
+                            engine_is_thinking,
+                            0.0,
+                        );
+                        window.request_redraw();
                     }
                 }
             }
