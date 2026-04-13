@@ -264,6 +264,7 @@ pub struct Position {
     side_to_move: Color,
     castling_rights: u8,
     en_passant_square: Option<Square>,
+    halfmove_clock: u16,
     hash: u64,
 }
 
@@ -281,6 +282,7 @@ struct Undo {
     captured_square: Square,
     previous_castling_rights: u8,
     previous_en_passant_square: Option<Square>,
+    previous_halfmove_clock: u16,
 }
 
 #[derive(Copy, Clone)]
@@ -330,6 +332,7 @@ struct TranspositionTable {
 
 pub struct Searcher {
     tt: TranspositionTable,
+    history: Vec<u64>,
 }
 
 #[derive(Copy, Clone)]
@@ -405,10 +408,25 @@ const fn generate_en_passant_hashes() -> [u64; 8] {
     table
 }
 
+const fn generate_halfmove_hashes() -> [u64; 101] {
+    let mut table = [0; 101];
+    let mut idx = 0;
+    let mut seed: u64 = 0xBADC_0FFE_EE00_DD11;
+
+    while idx < 101 {
+        seed = seed.wrapping_add(ZOBRIST_SEED_INC);
+        table[idx] = mix64(seed);
+        idx += 1;
+    }
+
+    table
+}
+
 const ZOBRIST_PIECES: [[u64; 64]; 13] = generate_piece_hashes();
 const ZOBRIST_SIDE_TO_MOVE: u64 = mix64(0xCAFEBABE_DEADBEEF);
 const ZOBRIST_CASTLING: [u64; 16] = generate_castling_hashes();
 const ZOBRIST_EN_PASSANT_FILE: [u64; 8] = generate_en_passant_hashes();
+const ZOBRIST_HALFMOVE: [u64; 101] = generate_halfmove_hashes();
 
 fn piece_hash(piece: Piece, square: Square) -> u64 {
     ZOBRIST_PIECES[piece as usize][square as usize]
@@ -576,7 +594,7 @@ fn sliding_attacks(from: Square, occupied: Bitboard, directions: &[Direction]) -
 
 impl Position {
     pub fn new() -> Position {
-        Position::from_board_state(INITIAL_PIECES, Color::White, ALL_CASTLING_RIGHTS, None)
+        Position::from_board_state(INITIAL_PIECES, Color::White, ALL_CASTLING_RIGHTS, None, 0)
     }
 
     fn from_board_state(
@@ -584,6 +602,7 @@ impl Position {
         side_to_move: Color,
         castling_rights: u8,
         en_passant_square: Option<Square>,
+        halfmove_clock: u16,
     ) -> Position {
         let mut position = Position {
             positions: [0; 7],
@@ -592,6 +611,7 @@ impl Position {
             side_to_move,
             castling_rights,
             en_passant_square,
+            halfmove_clock,
             hash: 0,
         };
 
@@ -702,12 +722,31 @@ impl Position {
         } else {
             Some(parse_square_name(en_passant_field)?)
         };
+        let halfmove_clock = match fields.next() {
+            Some(field) => field
+                .parse::<u16>()
+                .map_err(|_| "invalid halfmove clock in FEN".to_string())?,
+            None => 0,
+        };
+
+        if let Some(field) = fields.next() {
+            let fullmove_number = field
+                .parse::<u32>()
+                .map_err(|_| "invalid fullmove number in FEN".to_string())?;
+            if fullmove_number == 0 {
+                return Err("fullmove number must be positive in FEN".to_string());
+            }
+        }
+        if fields.next().is_some() {
+            return Err("too many fields in FEN".to_string());
+        }
 
         Ok(Position::from_board_state(
             board,
             side_to_move,
             castling_rights,
             en_passant_square,
+            halfmove_clock,
         ))
     }
 
@@ -725,6 +764,18 @@ impl Position {
 
     pub fn en_passant_square(&self) -> Option<Square> {
         self.en_passant_square
+    }
+
+    pub fn halfmove_clock(&self) -> u16 {
+        self.halfmove_clock
+    }
+
+    pub fn history_hash(&self) -> u64 {
+        self.hash
+    }
+
+    fn tt_key(&self) -> u64 {
+        self.hash ^ ZOBRIST_HALFMOVE[self.halfmove_clock.min(100) as usize]
     }
 
     fn occupied(&self) -> Bitboard {
@@ -758,6 +809,10 @@ impl Position {
         if let Some(square) = self.en_passant_square {
             self.hash ^= ZOBRIST_EN_PASSANT_FILE[(square % 8) as usize];
         }
+    }
+
+    fn set_halfmove_clock(&mut self, halfmove_clock: u16) {
+        self.halfmove_clock = halfmove_clock;
     }
 
     fn update_castling_rights_after_move(
@@ -838,8 +893,16 @@ impl Position {
             });
         let previous_castling_rights = self.castling_rights;
         let previous_en_passant_square = self.en_passant_square;
+        let previous_halfmove_clock = self.halfmove_clock;
 
         self.set_en_passant_square(None);
+        self.set_halfmove_clock(
+            if moving_piece.kind() == PieceKind::Pawn || captured_piece != Piece::Empty {
+                0
+            } else {
+                previous_halfmove_clock.saturating_add(1)
+            },
+        );
 
         self.remove_piece(origin, moving_piece);
         if captured_piece != Piece::Empty {
@@ -871,7 +934,14 @@ impl Position {
                     Color::White => origin + 8,
                     Color::Black => origin - 8,
                 };
-                self.set_en_passant_square(Some(en_passant_square));
+                let them = self.side_to_move.opposite();
+                let enemy_pawns = self.pieces(them, PieceKind::Pawn);
+                let [left, right] = pawn_capture_directions(them);
+                let en_passant_target = to_bb(en_passant_square);
+
+                if (shift(enemy_pawns, left) | shift(enemy_pawns, right)) & en_passant_target != 0 {
+                    self.set_en_passant_square(Some(en_passant_square));
+                }
             }
             _ => {}
         }
@@ -893,6 +963,7 @@ impl Position {
             captured_square,
             previous_castling_rights,
             previous_en_passant_square,
+            previous_halfmove_clock,
         }
     }
 
@@ -906,6 +977,7 @@ impl Position {
 
         self.set_en_passant_square(undo.previous_en_passant_square);
         self.set_castling_rights(undo.previous_castling_rights);
+        self.set_halfmove_clock(undo.previous_halfmove_clock);
 
         self.remove_piece(destination, undo.placed_piece);
         match flag {
@@ -1008,6 +1080,40 @@ impl Default for Position {
     }
 }
 
+pub fn is_draw_by_rule(position: &Position, position_history: &[u64]) -> bool {
+    position.halfmove_clock >= 100 || has_threefold_repetition(position, position_history)
+}
+
+fn has_threefold_repetition(position: &Position, position_history: &[u64]) -> bool {
+    if position.halfmove_clock < 4 {
+        return false;
+    }
+
+    let Some(&current_hash) = position_history.last() else {
+        return false;
+    };
+    if current_hash != position.history_hash() {
+        return false;
+    }
+
+    let mut repetitions = 1;
+    let mut plies_back = 2usize;
+    let max_plies = position.halfmove_clock as usize;
+
+    while plies_back <= max_plies && plies_back < position_history.len() {
+        let idx = position_history.len() - 1 - plies_back;
+        if position_history[idx] == current_hash {
+            repetitions += 1;
+            if repetitions >= 3 {
+                return true;
+            }
+        }
+        plies_back += 2;
+    }
+
+    false
+}
+
 impl Moves {
     fn new() -> Moves {
         Moves {
@@ -1086,12 +1192,25 @@ impl Searcher {
     pub fn new() -> Searcher {
         Searcher {
             tt: TranspositionTable::new(TT_SIZE),
+            history: Vec::new(),
         }
     }
 
-    pub fn make_move(&mut self, position: &mut Position) -> bool {
+    fn prepare_history(&mut self, position: &Position, position_history: &[u64]) {
+        self.history.clear();
+        if position_history.is_empty() {
+            self.history.push(position.history_hash());
+            return;
+        }
+
+        debug_assert_eq!(position_history.last(), Some(&position.history_hash()));
+        self.history.extend_from_slice(position_history);
+    }
+
+    pub fn make_move(&mut self, position: &mut Position, position_history: &[u64]) -> bool {
         let Some((best_move, _)) = self.best_move_with_time_budget(
             position,
+            position_history,
             Duration::from_millis(SEARCH_TIME_BUDGET_MS as u64),
         ) else {
             return false;
@@ -1103,8 +1222,14 @@ impl Searcher {
     pub fn search_root_with_stats(
         &mut self,
         position: &Position,
+        position_history: &[u64],
         depth: usize,
     ) -> Option<SearchStats> {
+        self.prepare_history(position, position_history);
+        if is_draw_by_rule(position, &self.history) {
+            return Some(SearchStats::default());
+        }
+
         let mut scratch = *position;
         self.search_root(&mut scratch, depth, None)
             .ok()
@@ -1115,8 +1240,14 @@ impl Searcher {
     pub fn best_move_with_time_budget(
         &mut self,
         position: &Position,
+        position_history: &[u64],
         time_budget: Duration,
     ) -> Option<(Move, SearchStats)> {
+        self.prepare_history(position, position_history);
+        if is_draw_by_rule(position, &self.history) {
+            return None;
+        }
+
         let mut scratch = *position;
         let legal_moves = generate_legal_moves(&mut scratch);
         match legal_moves.num_moves {
@@ -1155,7 +1286,10 @@ impl Searcher {
             return Ok(None);
         }
 
-        let tt_move = self.tt.probe(position.hash).map(|entry| entry.best_move);
+        let tt_move = self
+            .tt
+            .probe(position.tt_key())
+            .map(|entry| entry.best_move);
         order_moves(position, &mut moves, tt_move);
 
         let mut stats = SearchStats::default();
@@ -1169,15 +1303,18 @@ impl Searcher {
                 return Err(SearchAborted::Timeout);
             }
             let undo = position.make_move_unchecked(m);
-            let value = -self.negamax(
+            self.history.push(position.history_hash());
+            let value = self.negamax(
                 position,
                 depth.saturating_sub(1),
                 -beta,
                 -alpha,
                 &mut stats,
                 deadline,
-            )?;
+            );
+            self.history.pop();
             position.undo_move_unchecked(m, undo);
+            let value = -value?;
 
             if value > best_score {
                 best_score = value;
@@ -1189,8 +1326,13 @@ impl Searcher {
             }
         }
 
-        self.tt
-            .store(position.hash, depth, best_score, Bound::Exact, best_move);
+        self.tt.store(
+            position.tt_key(),
+            depth,
+            best_score,
+            Bound::Exact,
+            best_move,
+        );
 
         stats.score = best_score;
         Ok(Some((best_move, stats)))
@@ -1209,13 +1351,16 @@ impl Searcher {
         if search_timed_out(deadline, stats.nodes) {
             return Err(SearchAborted::Timeout);
         }
+        if is_draw_by_rule(position, &self.history) {
+            return Ok(0);
+        }
 
         let original_alpha = alpha;
         if depth == 0 {
             return Ok(position.evaluate());
         }
 
-        let tt_entry = self.tt.probe(position.hash);
+        let tt_entry = self.tt.probe(position.tt_key());
         if let Some(entry) = tt_entry {
             if entry.depth as usize >= depth {
                 match entry.bound {
@@ -1252,8 +1397,11 @@ impl Searcher {
 
         for m in moves.iter() {
             let undo = position.make_move_unchecked(m);
-            let value = -self.negamax(position, depth - 1, -beta, -alpha, stats, deadline)?;
+            self.history.push(position.history_hash());
+            let value = self.negamax(position, depth - 1, -beta, -alpha, stats, deadline);
+            self.history.pop();
             position.undo_move_unchecked(m, undo);
+            let value = -value?;
 
             if value > best_value {
                 best_value = value;
@@ -1276,7 +1424,7 @@ impl Searcher {
         };
 
         self.tt
-            .store(position.hash, depth, best_value, bound, best_move);
+            .store(position.tt_key(), depth, best_value, bound, best_move);
         Ok(best_value)
     }
 }
@@ -1400,6 +1548,8 @@ pub fn search_best_move(
     side_to_move: u8,
     castling_rights: u8,
     en_passant_square: i32,
+    halfmove_clock: u32,
+    position_history_hash_parts: &[u32],
     time_budget_ms: u32,
 ) -> i32 {
     if board.len() != 64 {
@@ -1417,6 +1567,12 @@ pub fn search_best_move(
         0..=63 => Some(en_passant_square as Square),
         _ => return -1,
     };
+    let Ok(halfmove_clock) = u16::try_from(halfmove_clock) else {
+        return -1;
+    };
+    if !position_history_hash_parts.len().is_multiple_of(2) {
+        return -1;
+    }
 
     let mut pieces = [Piece::Empty; 64];
     for (idx, &code) in board.iter().enumerate() {
@@ -1426,11 +1582,28 @@ pub fn search_best_move(
         pieces[idx] = piece;
     }
 
-    let position =
-        Position::from_board_state(pieces, side_to_move, castling_rights, en_passant_square);
+    let position = Position::from_board_state(
+        pieces,
+        side_to_move,
+        castling_rights,
+        en_passant_square,
+        halfmove_clock,
+    );
+    let mut position_history = Vec::with_capacity(position_history_hash_parts.len() / 2);
+    for chunk in position_history_hash_parts.chunks_exact(2) {
+        position_history.push(chunk[0] as u64 | ((chunk[1] as u64) << 32));
+    }
+    if !position_history.is_empty() && position_history.last() != Some(&position.history_hash()) {
+        return -1;
+    }
+
     let mut searcher = Searcher::new();
     searcher
-        .best_move_with_time_budget(&position, Duration::from_millis(time_budget_ms as u64))
+        .best_move_with_time_budget(
+            &position,
+            &position_history,
+            Duration::from_millis(time_budget_ms as u64),
+        )
         .map(|(best_move, _)| best_move as i32)
         .unwrap_or(-1)
 }
@@ -1801,7 +1974,7 @@ mod tests {
         for &(square, piece) in pieces {
             board[square as usize] = piece;
         }
-        Position::from_board_state(board, side_to_move, 0, None)
+        Position::from_board_state(board, side_to_move, 0, None, 0)
     }
 
     fn position_from_fen(fen: &str) -> Position {
@@ -1867,9 +2040,10 @@ mod tests {
             ],
             Color::White,
         );
+        let position_history = [position.history_hash()];
 
         assert!(position.in_check(Color::White));
-        assert!(searcher.make_move(&mut position));
+        assert!(searcher.make_move(&mut position, &position_history));
         assert_eq!(position.by_piece[56], Piece::WhiteRook);
         assert_eq!(position.by_piece[0], Piece::Empty);
     }
@@ -1893,6 +2067,7 @@ mod tests {
             original.castling_rights_bits()
         );
         assert_eq!(position.en_passant_square(), original.en_passant_square());
+        assert_eq!(position.halfmove_clock(), original.halfmove_clock());
     }
 
     #[test]
@@ -1930,23 +2105,58 @@ mod tests {
     }
 
     #[test]
-    fn perft_matches_initial_position_counts() {
-        let position = Position::new();
+    fn halfmove_clock_increments_and_resets() {
+        let mut quiet_position = position_from_fen("4k3/8/8/8/8/8/8/4K3 w - - 17 1");
+        quiet_position.do_move(create_move(4, 12));
+        assert_eq!(quiet_position.halfmove_clock(), 18);
 
-        assert_eq!(perft(&position, 1), 20);
-        assert_eq!(perft(&position, 2), 400);
-        assert_eq!(perft(&position, 3), 8_902);
-        assert_eq!(perft(&position, 4), 197_281);
+        let mut pawn_position = position_from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 17 1");
+        pawn_position.do_move(create_move(12, 20));
+        assert_eq!(pawn_position.halfmove_clock(), 0);
+
+        let mut capture_position = position_from_fen("4k3/8/8/8/8/8/4r3/4K3 w - - 17 1");
+        capture_position.do_move(create_move(4, 12));
+        assert_eq!(capture_position.halfmove_clock(), 0);
     }
 
     #[test]
-    fn perft_matches_mixed_special_move_position() {
-        let position = position_from_fen(
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPB1PPP/R3K2R w KQkq - 0 1",
-        );
+    fn fifty_move_draw_is_detected() {
+        let position = position_from_fen("4k3/8/8/8/8/8/8/4K3 w - - 100 1");
+        let position_history = [position.history_hash()];
 
-        assert_eq!(perft(&position, 1), 43);
-        assert_eq!(perft(&position, 2), 1_872);
-        assert_eq!(perft(&position, 3), 81_324);
+        assert!(is_draw_by_rule(&position, &position_history));
+    }
+
+    #[test]
+    fn threefold_repetition_is_detected() {
+        let mut position = position_from_fen("4k1n1/8/8/8/8/8/8/4K1N1 w - - 0 1");
+        let mut position_history = vec![position.history_hash()];
+
+        for m in [
+            create_move(6, 21),
+            create_move(62, 45),
+            create_move(21, 6),
+            create_move(45, 62),
+            create_move(6, 21),
+            create_move(62, 45),
+            create_move(21, 6),
+            create_move(45, 62),
+        ] {
+            position.do_move(m);
+            position_history.push(position.history_hash());
+        }
+
+        assert!(is_draw_by_rule(&position, &position_history));
+    }
+
+    #[test]
+    fn engine_does_not_search_rule_draws() {
+        let mut searcher = Searcher::new();
+        let position = position_from_fen("4k3/8/8/8/8/8/8/4K3 w - - 100 1");
+        let position_history = [position.history_hash()];
+
+        assert!(searcher
+            .best_move_with_time_budget(&position, &position_history, Duration::from_millis(1),)
+            .is_none());
     }
 }

@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use onion::engine::{try_player_move, Move, Position, Square, SEARCH_TIME_BUDGET_MS};
+use onion::engine::{
+    is_draw_by_rule, try_player_move, Move, Position, Square, SEARCH_TIME_BUDGET_MS,
+};
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -96,6 +98,16 @@ fn write_gpu_state(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn position_history_hash_parts(position_history: &[u64]) -> js_sys::Array {
+    let parts = js_sys::Array::new();
+    for &hash in position_history {
+        parts.push(&JsValue::from_f64((hash as u32) as f64));
+        parts.push(&JsValue::from_f64((hash >> 32) as f64));
+    }
+    parts
+}
+
+#[cfg(target_arch = "wasm32")]
 fn sync_debug_state(position: &Position, engine_is_thinking: bool, request_id: u32) {
     let window = web_sys::window().expect("window should exist");
     let debug_state = js_sys::Object::new();
@@ -128,6 +140,12 @@ fn sync_debug_state(position: &Position, engine_is_thinking: bool, request_id: u
                 .en_passant_square()
                 .map_or(-1.0, |square| square as f64),
         ),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &debug_state,
+        &JsValue::from_str("halfmoveClock"),
+        &JsValue::from_f64(position.halfmove_clock() as f64),
     )
     .unwrap();
     js_sys::Reflect::set(
@@ -216,13 +234,14 @@ impl EngineDriver {
         EngineDriver { proxy }
     }
 
-    fn request_move(&self, request_id: u32, position: Position) {
+    fn request_move(&self, request_id: u32, position: Position, position_history: Vec<u64>) {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let mut searcher = Searcher::new();
             let best_move = searcher
                 .best_move_with_time_budget(
                     &position,
+                    &position_history,
                     Duration::from_millis(SEARCH_TIME_BUDGET_MS as u64),
                 )
                 .map(|(best_move, _)| best_move);
@@ -261,7 +280,7 @@ async function ensureInit() {{
 }}
 
 self.onmessage = async (event) => {{
-  const [requestId, sideToMove, castlingRights, enPassantSquare, timeBudgetMs, board] = event.data;
+  const [requestId, sideToMove, castlingRights, enPassantSquare, halfmoveClock, timeBudgetMs, historyHashParts, board] = event.data;
   try {{
     await ensureInit();
     const bestMove = search_best_move(
@@ -269,6 +288,8 @@ self.onmessage = async (event) => {{
       sideToMove,
       castlingRights,
       enPassantSquare,
+      halfmoveClock,
+      Uint32Array.from(historyHashParts),
       timeBudgetMs,
     );
     self.postMessage([requestId, bestMove, null]);
@@ -342,13 +363,14 @@ self.onmessage = async (event) => {{
         }
     }
 
-    fn request_move(&self, request_id: u32, position: Position) {
+    fn request_move(&self, request_id: u32, position: Position, position_history: &[u64]) {
         let board = js_sys::Array::new();
         for square in 0..64 {
             board.push(&JsValue::from_f64(
                 position.piece_at(square as Square) as i32 as f64,
             ));
         }
+        let history_hash_parts = position_history_hash_parts(position_history);
 
         let payload = js_sys::Array::new();
         payload.push(&JsValue::from_f64(request_id as f64));
@@ -359,7 +381,9 @@ self.onmessage = async (event) => {{
                 .en_passant_square()
                 .map_or(-1.0, |square| square as f64),
         ));
+        payload.push(&JsValue::from_f64(position.halfmove_clock() as f64));
         payload.push(&JsValue::from_f64(SEARCH_TIME_BUDGET_MS as f64));
+        payload.push(&history_hash_parts);
         let board_js: JsValue = board.into();
         payload.push(&board_js);
 
@@ -425,6 +449,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
 
     let engine_driver = EngineDriver::new(event_loop.create_proxy());
     let mut position = Position::new();
+    let mut position_history = vec![position.history_hash()];
     let gpu_state = GpuState::new(&position, false, 0.0);
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -505,6 +530,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let mut mouse_positions = [PhysicalPosition::default(); 2];
     let mut pending_move_selection = false;
     let mut engine_is_thinking = false;
+    let mut game_over = false;
     let mut thinking_started_time_seconds = 0.0f32;
     let mut active_request_id = 0u32;
     #[cfg(target_arch = "wasm32")]
@@ -571,14 +597,12 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 animation_loop.stop();
                 if let Some(best_move) = best_move {
                     position.do_move(best_move);
+                    position_history.push(position.history_hash());
+                    game_over = is_draw_by_rule(&position, &position_history);
+                } else {
+                    game_over = true;
                 }
-                write_gpu_state(
-                    &queue,
-                    &uniform_buf,
-                    &position,
-                    engine_is_thinking,
-                    0.0,
-                );
+                write_gpu_state(&queue, &uniform_buf, &position, engine_is_thinking, 0.0);
                 window.request_redraw();
                 #[cfg(target_arch = "wasm32")]
                 sync_debug_state(&position, engine_is_thinking, active_request_id);
@@ -596,7 +620,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 event: WindowEvent::MouseInput { button, state, .. },
                 ..
             } => {
-                if button == MouseButton::Left && !engine_is_thinking {
+                if button == MouseButton::Left && !engine_is_thinking && !game_over {
                     if state == winit::event::ElementState::Released {
                         if let Some(mouse_pos) = current_mouse_pos {
                             mouse_positions[mouse_index] = mouse_pos;
@@ -613,24 +637,59 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                             mouse_to_square(mouse_positions[1], window_size),
                         ) {
                             if try_player_move(&mut position, from, to) {
-                                engine_is_thinking = true;
-                                // Reset the pulse phase so black pieces always start fully opaque.
-                                thinking_started_time_seconds =
-                                    animation_time_seconds(animation_start);
-                                active_request_id = active_request_id.wrapping_add(1);
-                                #[cfg(target_arch = "wasm32")]
-                                animation_loop.start();
-                                write_gpu_state(
-                                    &queue,
-                                    &uniform_buf,
-                                    &position,
-                                    engine_is_thinking,
-                                    0.0,
-                                );
-                                window.request_redraw();
-                                #[cfg(target_arch = "wasm32")]
-                                sync_debug_state(&position, engine_is_thinking, active_request_id);
-                                engine_driver.request_move(active_request_id, position);
+                                position_history.push(position.history_hash());
+                                game_over = is_draw_by_rule(&position, &position_history);
+
+                                if !game_over {
+                                    engine_is_thinking = true;
+                                    // Reset the pulse phase so black pieces always start fully opaque.
+                                    thinking_started_time_seconds =
+                                        animation_time_seconds(animation_start);
+                                    active_request_id = active_request_id.wrapping_add(1);
+                                    #[cfg(target_arch = "wasm32")]
+                                    animation_loop.start();
+                                    write_gpu_state(
+                                        &queue,
+                                        &uniform_buf,
+                                        &position,
+                                        engine_is_thinking,
+                                        0.0,
+                                    );
+                                    window.request_redraw();
+                                    #[cfg(target_arch = "wasm32")]
+                                    sync_debug_state(
+                                        &position,
+                                        engine_is_thinking,
+                                        active_request_id,
+                                    );
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    engine_driver.request_move(
+                                        active_request_id,
+                                        position,
+                                        position_history.clone(),
+                                    );
+                                    #[cfg(target_arch = "wasm32")]
+                                    engine_driver.request_move(
+                                        active_request_id,
+                                        position,
+                                        &position_history,
+                                    );
+                                } else {
+                                    write_gpu_state(
+                                        &queue,
+                                        &uniform_buf,
+                                        &position,
+                                        engine_is_thinking,
+                                        0.0,
+                                    );
+                                    window.request_redraw();
+                                    #[cfg(target_arch = "wasm32")]
+                                    sync_debug_state(
+                                        &position,
+                                        engine_is_thinking,
+                                        active_request_id,
+                                    );
+                                }
                             }
                         }
                     }

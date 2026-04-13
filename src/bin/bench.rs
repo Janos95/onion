@@ -18,8 +18,9 @@ fn benchmark_position(name: &str, position: &Position, max_depth: usize, max_sec
 
     for depth in 1..=max_depth {
         let mut searcher = Searcher::new();
+        let position_history = [position.history_hash()];
         let start = Instant::now();
-        let stats = searcher.search_root_with_stats(position, depth);
+        let stats = searcher.search_root_with_stats(position, &position_history, depth);
         let elapsed = start.elapsed();
         let seconds = elapsed.as_secs_f64();
 
