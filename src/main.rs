@@ -59,7 +59,6 @@ struct MovingPieceVisual {
     board_position: [f32; 2],
     target: Square,
     captured_piece: Piece,
-    capture_progress: f32,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -74,26 +73,80 @@ struct MoveAnimation {
 }
 
 const MOVE_ANIMATION_DURATION_SECONDS: f32 = 0.63;
-const MOVING_PIECE_SMOOTH_UNION_RADIUS: f32 = 0.35;
+const CAPTURE_MOVE_ANIMATION_DURATION_SECONDS: f32 = 1.0;
+const CAPTURE_CONTACT_TIME_SECONDS: f32 = 0.2;
+const MOVING_PIECE_SMOOTH_UNION_RADIUS: f32 = 0.5;
 
 fn eased_progress(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-fn move_animation_visual(
-    animation: MoveAnimation,
-    now_seconds: f32,
-) -> MovingPieceVisual {
-    let progress = eased_progress(
-        (now_seconds - animation.started_time_seconds) / MOVE_ANIMATION_DURATION_SECONDS,
-    );
+fn hermite_segment(x0: f32, y0: f32, m0: f32, x1: f32, y1: f32, m1: f32, x: f32) -> f32 {
+    let h = x1 - x0;
+    let t = ((x - x0) / h).clamp(0.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    (2.0 * t3 - 3.0 * t2 + 1.0) * y0
+        + (t3 - 2.0 * t2 + t) * h * m0
+        + (-2.0 * t3 + 3.0 * t2) * y1
+        + (t3 - t2) * h * m1
+}
+
+fn smooth_capture_path_progress(raw_progress: f32, contact_time_fraction: f32, contact_path_progress: f32) -> f32 {
+    let x = raw_progress.clamp(0.0, 1.0);
+    let x1 = contact_time_fraction.clamp(0.001, 0.999);
+    let y1 = contact_path_progress.clamp(0.0, 1.0);
+
+    let h0 = x1;
+    let h1 = 1.0 - x1;
+    let d0 = y1 / h0;
+    let d1 = (1.0 - y1) / h1;
+
+    let mut m0 = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+    if m0.signum() != d0.signum() {
+        m0 = 0.0;
+    } else if m0.abs() > 3.0 * d0.abs() {
+        m0 = 3.0 * d0;
+    }
+
+    let m1 = if d0 > 0.0 && d1 > 0.0 {
+        let w0 = 2.0 * h1 + h0;
+        let w1 = h1 + 2.0 * h0;
+        (w0 + w1) / (w0 / d0 + w1 / d1)
+    } else {
+        0.0
+    };
+
+    let mut m2 = ((2.0 * h1 + h0) * d1 - h1 * d0) / (h0 + h1);
+    if m2.signum() != d1.signum() {
+        m2 = 0.0;
+    } else if m2.abs() > 3.0 * d1.abs() {
+        m2 = 3.0 * d1;
+    }
+
+    if x <= x1 {
+        hermite_segment(0.0, 0.0, m0, x1, y1, m1, x)
+    } else {
+        hermite_segment(x1, y1, m1, 1.0, 1.0, m2, x)
+    }
+}
+
+fn move_animation_duration(animation: MoveAnimation) -> f32 {
+    if animation.captured_piece != Piece::Empty {
+        CAPTURE_MOVE_ANIMATION_DURATION_SECONDS
+    } else {
+        MOVE_ANIMATION_DURATION_SECONDS
+    }
+}
+
+fn move_path_position(animation: MoveAnimation, progress: f32) -> [f32; 2] {
     let from = square_center(animation.from);
     let to = square_center(animation.to);
     let dx = to[0] - from[0];
     let dy = to[1] - from[1];
     let is_knight = matches!(animation.piece, Piece::WhiteKnight | Piece::BlackKnight);
-    let board_position = if is_knight {
+    if is_knight {
         let (corner, first_leg_fraction) = if dx.abs() > dy.abs() {
             ([to[0], from[1]], 2.0 / 3.0)
         } else {
@@ -114,23 +167,52 @@ fn move_animation_visual(
             ]
         }
     } else {
-        [
-            from[0] + dx * progress,
-            from[1] + dy * progress,
-        ]
-    };
-    let capture_progress = if animation.captured_piece != Piece::Empty {
-        eased_progress(((progress - 0.6) / 0.4).clamp(0.0, 1.0))
+        [from[0] + dx * progress, from[1] + dy * progress]
+    }
+}
+
+fn square_boxes_touch(position: [f32; 2], target_center: [f32; 2]) -> bool {
+    (position[0] - target_center[0]).abs() <= 1.0 && (position[1] - target_center[1]).abs() <= 1.0
+}
+
+fn capture_contact_path_progress(animation: MoveAnimation) -> f32 {
+    let target_center = square_center(animation.to);
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    for _ in 0..24 {
+        let mid = 0.5 * (low + high);
+        if square_boxes_touch(move_path_position(animation, mid), target_center) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    high
+}
+
+fn move_animation_visual(animation: MoveAnimation, now_seconds: f32) -> MovingPieceVisual {
+    let raw_progress = ((now_seconds - animation.started_time_seconds)
+        / move_animation_duration(animation))
+        .clamp(0.0, 1.0);
+    let path_progress = if animation.captured_piece != Piece::Empty {
+        let contact_path_progress = capture_contact_path_progress(animation);
+        let contact_time_fraction =
+            CAPTURE_CONTACT_TIME_SECONDS / CAPTURE_MOVE_ANIMATION_DURATION_SECONDS;
+        smooth_capture_path_progress(
+            raw_progress,
+            contact_time_fraction,
+            contact_path_progress,
+        )
     } else {
-        0.0
+        eased_progress(raw_progress)
     };
+
     MovingPieceVisual {
         origin: animation.from,
         piece: animation.piece,
-        board_position,
+        board_position: move_path_position(animation, path_progress),
         target: animation.to,
         captured_piece: animation.captured_piece,
-        capture_progress,
     }
 }
 
@@ -193,7 +275,7 @@ impl GpuState {
                 1.0,
                 moving_piece.board_position[0],
                 moving_piece.board_position[1],
-                moving_piece.capture_progress,
+                MOVING_PIECE_SMOOTH_UNION_RADIUS,
             ];
             board.moving_piece = [
                 moving_piece.piece as i32,
@@ -680,7 +762,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 let mut completed_animation = false;
                 if let Some(active_animation) = move_animation {
                     if now_seconds - active_animation.started_time_seconds
-                        >= MOVE_ANIMATION_DURATION_SECONDS
+                        >= move_animation_duration(active_animation)
                     {
                         move_animation = None;
                         position.do_move(active_animation.move_to_apply);
@@ -726,7 +808,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 let mut completed_animation = false;
                 if let Some(active_animation) = move_animation {
                     if now_seconds - active_animation.started_time_seconds
-                        >= MOVE_ANIMATION_DURATION_SECONDS
+                        >= move_animation_duration(active_animation)
                     {
                         move_animation = None;
                         position.do_move(active_animation.move_to_apply);

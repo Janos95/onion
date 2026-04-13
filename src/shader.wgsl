@@ -60,6 +60,11 @@ fn sd_circle(p : v2, r : f32) -> f32
     return length(p) - r;
 }
 
+fn ease(x : f32) -> f32
+{
+    return x * x * (3.0 - 2.0 * x);
+}
+
 fn sd_box(p : v2, b : v2) -> f32
 {
     let d = abs(p)-b;
@@ -346,8 +351,7 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let d_base = dispatch_piece(p, square_id);
     let piece = state.pieces[square_id / 4][square_id % 4];
     let is_black_piece = piece != 0 && (piece & 1) == 0;
-    let black_growth = thinking * 3.0 * max(fwidth(d_base), 0.002) * pulse_strength;
-    let d = select(d_base, d_base - black_growth, is_black_piece);
+    let d = d_base;
     let marker = square_marker(square_id);
     let is_selected_piece = marker == 2;
     let square = square_color(i, j);
@@ -358,26 +362,52 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let disk_strength = 1.0 - smoothstep(0.0, disk_aa, disk_distance);
     let moving_piece_active = state.moving_piece_state.x > 0.5;
     let moving_piece_center = state.moving_piece_state.yz;
-    let capture_progress = state.moving_piece_state.w;
+    let blend_k = state.moving_piece_state.w;
     let moving_piece = state.moving_piece.x;
     let moving_piece_target_square = state.moving_piece.y;
     let captured_piece = state.moving_piece.z;
     let d_moving = dispatch_piece_code(2.0 * (v2(x, y) - moving_piece_center), moving_piece);
     let moving_piece_color = piece_color_from_code(moving_piece);
-    let blend_k = 0.35;
-    let d_composed = select(d, op_smooth_union(d, d_moving, blend_k), moving_piece_active);
+    let target_center = v2(
+        f32(moving_piece_target_square % 8) + 0.5,
+        f32(moving_piece_target_square / 8) + 0.5,
+    );
+    let overlap_x = max(0.0, 1.0 - abs(moving_piece_center.x - target_center.x));
+    let overlap_y = max(0.0, 1.0 - abs(moving_piece_center.y - target_center.y));
+    let capture_overlap = select(0.0, ease(clamp(overlap_x * overlap_y, 0.0, 1.0)), captured_piece != 0);
+    let capture_morph = capture_overlap * capture_overlap;
+    let is_capture_target_square =
+        captured_piece != 0 && i32(moving_piece_target_square) == square_id;
     let board_color = piece_color(square_id);
-    let board_component_color = select(square, board_color, piece != 0);
-    let moving_piece_band = 8.0 * max(fwidth(d_moving), 0.002);
-    let moving_piece_base_alpha = select(
-        0.0,
-        1.0 - smoothstep(-moving_piece_band, moving_piece_band, d_moving),
+    let black_piece_alpha = select(1.0, 1.0 - 0.25 * thinking * pulse_strength, is_black_piece);
+    let board_piece_color = mix(square, board_color, black_piece_alpha);
+    let board_component_color = select(square, board_piece_color, piece != 0);
+    let moving_piece_blend = select(
+        1.0,
+        op_smooth_union_blend(d, d_moving, blend_k),
         moving_piece_active,
     );
-    let capture_square_match = i32(moving_piece_target_square) == square_id;
-    let capture_alpha = select(1.0, capture_progress, capture_square_match && captured_piece != 0);
-    let moving_piece_color_alpha = moving_piece_base_alpha * capture_alpha;
-    let base_piece_color = mix(board_component_color, moving_piece_color, moving_piece_color_alpha);
+    let d_moving_at_target = dispatch_piece_code(p, moving_piece);
+    let capture_target_b_morph = mix(d, d_moving_at_target, capture_morph);
+    let capture_union_taper = smoothstep(0.5, 1.0, capture_overlap);
+    let capture_target_d = mix(
+        op_smooth_union(d_moving, capture_target_b_morph, blend_k),
+        op_union(d_moving, capture_target_b_morph),
+        capture_union_taper,
+    );
+    let d_composed = select(
+        select(d, op_smooth_union(d, d_moving, blend_k), moving_piece_active),
+        capture_target_d,
+        is_capture_target_square,
+    );
+    let capture_target_b_morph_color = mix(board_component_color, moving_piece_color, capture_morph);
+    let capture_target_color = capture_target_b_morph_color;
+    let normal_move_color = mix(moving_piece_color, board_component_color, moving_piece_blend);
+    let base_piece_color = select(
+        normal_move_color,
+        capture_target_color,
+        is_capture_target_square,
+    );
 
     var col : v3;
     if d_composed < 0.0 {
@@ -388,7 +418,7 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     }
 
     if marker == 1 {
-        let disk_alpha = select(0.9, 0.65, piece != 0);
+        let disk_alpha = select(0.9, 0.85, piece != 0);
         col = mix(col, move_disk, disk_strength * disk_alpha);
     }
 
@@ -396,6 +426,10 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_composed));
     let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
     col = mix(col, outline_color, outline);
+
+    if marker == 1 {
+        col = mix(col, move_disk, disk_strength * 0.25);
+    }
 
     return v4(col.x, col.y, col.z, 1.);
 }
