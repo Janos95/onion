@@ -234,21 +234,27 @@ struct GpuState {
 unsafe impl Zeroable for GpuState {}
 unsafe impl Pod for GpuState {}
 
+#[derive(Debug, Copy, Clone)]
+struct RenderState {
+    selected_square: Option<Square>,
+    legal_move_destinations: u64,
+    moving_piece: Option<MovingPieceVisual>,
+    engine_is_thinking: bool,
+    animation_time_seconds: f32,
+}
+
 impl GpuState {
-    fn new(
-        position: &Position,
-        selected_square: Option<Square>,
-        legal_move_destinations: u64,
-        moving_piece: Option<MovingPieceVisual>,
-        engine_is_thinking: bool,
-        animation_time_seconds: f32,
-    ) -> GpuState {
+    fn new(position: &Position, render_state: RenderState) -> GpuState {
         let mut board = GpuState {
             pieces: [0; 64],
             markers: [0; 64],
             status: [
-                if engine_is_thinking { 1.0 } else { 0.0 },
-                animation_time_seconds,
+                if render_state.engine_is_thinking {
+                    1.0
+                } else {
+                    0.0
+                },
+                render_state.animation_time_seconds,
                 0.0,
                 0.0,
             ],
@@ -257,16 +263,16 @@ impl GpuState {
         };
         for square in 0..64 {
             board.pieces[square] = position.piece_at(square as Square) as i32;
-            if (legal_move_destinations & (1u64 << square)) != 0 {
+            if (render_state.legal_move_destinations & (1u64 << square)) != 0 {
                 board.markers[square] = 1;
             }
         }
 
-        if let Some(square) = selected_square {
+        if let Some(square) = render_state.selected_square {
             board.markers[square as usize] = 2;
         }
 
-        if let Some(moving_piece) = moving_piece {
+        if let Some(moving_piece) = render_state.moving_piece {
             board.pieces[moving_piece.origin as usize] = Piece::Empty as i32;
             board.moving_piece_state = [
                 1.0,
@@ -299,25 +305,13 @@ fn animation_time_seconds(start_time_ms: f64) -> f32 {
     ((js_sys::Date::now() - start_time_ms) / 1000.0) as f32
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_gpu_state(
     queue: &wgpu::Queue,
     uniform_buf: &wgpu::Buffer,
     position: &Position,
-    selected_square: Option<Square>,
-    legal_move_destinations: u64,
-    moving_piece: Option<MovingPieceVisual>,
-    engine_is_thinking: bool,
-    animation_time_seconds: f32,
+    render_state: RenderState,
 ) {
-    let gpu_state = GpuState::new(
-        position,
-        selected_square,
-        legal_move_destinations,
-        moving_piece,
-        engine_is_thinking,
-        animation_time_seconds,
-    );
+    let gpu_state = GpuState::new(position, render_state);
     queue.write_buffer(uniform_buf, 0, gpu_state.as_byte_slice());
 }
 
@@ -674,7 +668,16 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let engine_driver = EngineDriver::new(event_loop.create_proxy());
     let mut position = Position::new();
     let mut position_history = vec![position.history_hash()];
-    let gpu_state = GpuState::new(&position, None, 0, None, false, 0.0);
+    let gpu_state = GpuState::new(
+        &position,
+        RenderState {
+            selected_square: None,
+            legal_move_destinations: 0,
+            moving_piece: None,
+            engine_is_thinking: false,
+            animation_time_seconds: 0.0,
+        },
+    );
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Uniform Buffer"),
@@ -817,12 +820,14 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         &queue,
                         &uniform_buf,
                         &position,
-                        selected_square,
-                        selected_moves_mask,
-                        move_animation
-                            .map(|animation| move_animation_visual(animation, now_seconds)),
-                        engine_is_thinking,
-                        thinking_elapsed,
+                        RenderState {
+                            selected_square,
+                            legal_move_destinations: selected_moves_mask,
+                            moving_piece: move_animation
+                                .map(|animation| move_animation_visual(animation, now_seconds)),
+                            engine_is_thinking,
+                            animation_time_seconds: thinking_elapsed,
+                        },
                     );
                     window.request_redraw();
                 } else {
@@ -865,12 +870,14 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         &queue,
                         &uniform_buf,
                         &position,
-                        selected_square,
-                        selected_moves_mask,
-                        move_animation
-                            .map(|animation| move_animation_visual(animation, now_seconds)),
-                        engine_is_thinking,
-                        thinking_elapsed,
+                        RenderState {
+                            selected_square,
+                            legal_move_destinations: selected_moves_mask,
+                            moving_piece: move_animation
+                                .map(|animation| move_animation_visual(animation, now_seconds)),
+                            engine_is_thinking,
+                            animation_time_seconds: thinking_elapsed,
+                        },
                     );
                     window.request_redraw();
                 }
@@ -911,11 +918,14 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                     &queue,
                     &uniform_buf,
                     &position,
-                    selected_square,
-                    selected_moves_mask,
-                    move_animation.map(|animation| move_animation_visual(animation, now_seconds)),
-                    engine_is_thinking,
-                    0.0,
+                    RenderState {
+                        selected_square,
+                        legal_move_destinations: selected_moves_mask,
+                        moving_piece: move_animation
+                            .map(|animation| move_animation_visual(animation, now_seconds)),
+                        engine_is_thinking,
+                        animation_time_seconds: 0.0,
+                    },
                 );
                 window.request_redraw();
             }
@@ -975,13 +985,15 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                                     &queue,
                                     &uniform_buf,
                                     &position,
-                                    selected_square,
-                                    selected_moves_mask,
-                                    move_animation.map(|animation| {
-                                        move_animation_visual(animation, now_seconds)
-                                    }),
-                                    engine_is_thinking,
-                                    0.0,
+                                    RenderState {
+                                        selected_square,
+                                        legal_move_destinations: selected_moves_mask,
+                                        moving_piece: move_animation.map(|animation| {
+                                            move_animation_visual(animation, now_seconds)
+                                        }),
+                                        engine_is_thinking,
+                                        animation_time_seconds: 0.0,
+                                    },
                                 );
                                 window.request_redraw();
                                 return;
@@ -994,11 +1006,13 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                     &queue,
                     &uniform_buf,
                     &position,
-                    selected_square,
-                    selected_moves_mask,
-                    None,
-                    engine_is_thinking,
-                    0.0,
+                    RenderState {
+                        selected_square,
+                        legal_move_destinations: selected_moves_mask,
+                        moving_piece: None,
+                        engine_is_thinking,
+                        animation_time_seconds: 0.0,
+                    },
                 );
                 window.request_redraw();
             }
