@@ -1,0 +1,12 @@
+# name | moving_piece | from | to | target_piece | extras
+# pieces: P p N n B b R r Q q K k .  (or WhitePawn / BlackQueen / Empty)
+# extras: comma-separated square:piece pairs, or -
+
+# Pawn x Pawn | P | d4 | e5 | p | -
+# Knight x Bishop | N | c3 | d5 | b | -
+# Bishop x Knight | B | b2 | e5 | n | -
+# Rook x Queen | R | b4 | f4 | q | -
+# Black Queen x Rook | q | f6 | c3 | R | -
+# Knight over White Pawn | N | b1 | c3 | . | b2:P
+Knight over Black Pawn | N | g1 | f3 | . | g2:p
+# Bishop through Mixed Line | B | c1 | g5 | . | d2:P, e3:p, f4:N

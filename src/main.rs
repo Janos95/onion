@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use onion::engine::{
-    is_draw_by_rule, try_player_move, Move, Position, Square, SEARCH_TIME_BUDGET_MS,
+    is_draw_by_rule, is_selectable_piece, legal_move_destinations, player_move, Move, Piece,
+    Position, Square, SEARCH_TIME_BUDGET_MS,
 };
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,29 +45,241 @@ fn mouse_to_square(
     Some((x + y * 8) as Square)
 }
 
+fn square_center(square: Square) -> [f32; 2] {
+    [(square % 8) as f32 + 0.5, (square / 8) as f32 + 0.5]
+}
+
+#[derive(Debug, Copy, Clone)]
+struct MovingPieceVisual {
+    origin: Square,
+    piece: Piece,
+    board_position: [f32; 2],
+    target: Square,
+    captured_piece: Piece,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct MoveAnimation {
+    from: Square,
+    to: Square,
+    piece: Piece,
+    captured_piece: Piece,
+    move_to_apply: Move,
+    started_time_seconds: f32,
+    start_engine_after: bool,
+}
+
+const MOVE_ANIMATION_DURATION_SECONDS: f32 = 0.63;
+const CAPTURE_MOVE_ANIMATION_DURATION_SECONDS: f32 = 1.0;
+const CAPTURE_CONTACT_TIME_SECONDS: f32 = 0.2;
+const MOVING_PIECE_SMOOTH_UNION_RADIUS: f32 = 0.5;
+
+fn eased_progress(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn hermite_segment(x0: f32, y0: f32, m0: f32, x1: f32, y1: f32, m1: f32, x: f32) -> f32 {
+    let h = x1 - x0;
+    let t = ((x - x0) / h).clamp(0.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    (2.0 * t3 - 3.0 * t2 + 1.0) * y0
+        + (t3 - 2.0 * t2 + t) * h * m0
+        + (-2.0 * t3 + 3.0 * t2) * y1
+        + (t3 - t2) * h * m1
+}
+
+fn smooth_capture_path_progress(
+    raw_progress: f32,
+    contact_time_fraction: f32,
+    contact_path_progress: f32,
+) -> f32 {
+    let x = raw_progress.clamp(0.0, 1.0);
+    let x1 = contact_time_fraction.clamp(0.001, 0.999);
+    let y1 = contact_path_progress.clamp(0.0, 1.0);
+
+    let h0 = x1;
+    let h1 = 1.0 - x1;
+    let d0 = y1 / h0;
+    let d1 = (1.0 - y1) / h1;
+
+    let mut m0 = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+    if m0.signum() != d0.signum() {
+        m0 = 0.0;
+    } else if m0.abs() > 3.0 * d0.abs() {
+        m0 = 3.0 * d0;
+    }
+
+    let m1 = if d0 > 0.0 && d1 > 0.0 {
+        let w0 = 2.0 * h1 + h0;
+        let w1 = h1 + 2.0 * h0;
+        (w0 + w1) / (w0 / d0 + w1 / d1)
+    } else {
+        0.0
+    };
+
+    let mut m2 = ((2.0 * h1 + h0) * d1 - h1 * d0) / (h0 + h1);
+    if m2.signum() != d1.signum() {
+        m2 = 0.0;
+    } else if m2.abs() > 3.0 * d1.abs() {
+        m2 = 3.0 * d1;
+    }
+
+    if x <= x1 {
+        hermite_segment(0.0, 0.0, m0, x1, y1, m1, x)
+    } else {
+        hermite_segment(x1, y1, m1, 1.0, 1.0, m2, x)
+    }
+}
+
+fn move_animation_duration(animation: MoveAnimation) -> f32 {
+    if animation.captured_piece != Piece::Empty {
+        CAPTURE_MOVE_ANIMATION_DURATION_SECONDS
+    } else {
+        MOVE_ANIMATION_DURATION_SECONDS
+    }
+}
+
+fn move_path_position(animation: MoveAnimation, progress: f32) -> [f32; 2] {
+    let from = square_center(animation.from);
+    let to = square_center(animation.to);
+    let dx = to[0] - from[0];
+    let dy = to[1] - from[1];
+    let is_knight = matches!(animation.piece, Piece::WhiteKnight | Piece::BlackKnight);
+    if is_knight {
+        let (corner, first_leg_fraction) = if dx.abs() > dy.abs() {
+            ([to[0], from[1]], 2.0 / 3.0)
+        } else {
+            ([from[0], to[1]], 2.0 / 3.0)
+        };
+
+        if progress < first_leg_fraction {
+            let local_t = progress / first_leg_fraction;
+            [
+                from[0] + (corner[0] - from[0]) * local_t,
+                from[1] + (corner[1] - from[1]) * local_t,
+            ]
+        } else {
+            let local_t = (progress - first_leg_fraction) / (1.0 - first_leg_fraction);
+            [
+                corner[0] + (to[0] - corner[0]) * local_t,
+                corner[1] + (to[1] - corner[1]) * local_t,
+            ]
+        }
+    } else {
+        [from[0] + dx * progress, from[1] + dy * progress]
+    }
+}
+
+fn square_boxes_touch(position: [f32; 2], target_center: [f32; 2]) -> bool {
+    (position[0] - target_center[0]).abs() <= 1.0 && (position[1] - target_center[1]).abs() <= 1.0
+}
+
+fn capture_contact_path_progress(animation: MoveAnimation) -> f32 {
+    let target_center = square_center(animation.to);
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    for _ in 0..24 {
+        let mid = 0.5 * (low + high);
+        if square_boxes_touch(move_path_position(animation, mid), target_center) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    high
+}
+
+fn move_animation_visual(animation: MoveAnimation, now_seconds: f32) -> MovingPieceVisual {
+    let raw_progress = ((now_seconds - animation.started_time_seconds)
+        / move_animation_duration(animation))
+    .clamp(0.0, 1.0);
+    let path_progress = if animation.captured_piece != Piece::Empty {
+        let contact_path_progress = capture_contact_path_progress(animation);
+        let contact_time_fraction =
+            CAPTURE_CONTACT_TIME_SECONDS / CAPTURE_MOVE_ANIMATION_DURATION_SECONDS;
+        smooth_capture_path_progress(raw_progress, contact_time_fraction, contact_path_progress)
+    } else {
+        eased_progress(raw_progress)
+    };
+
+    MovingPieceVisual {
+        origin: animation.from,
+        piece: animation.piece,
+        board_position: move_path_position(animation, path_progress),
+        target: animation.to,
+        captured_piece: animation.captured_piece,
+    }
+}
+
+fn move_origin_square(m: Move) -> Square {
+    (m >> 6) & 0x3F
+}
+
+fn move_destination_square(m: Move) -> Square {
+    m & 0x3F
+}
+
 #[repr(C, align(16))]
 #[derive(Debug, Copy, Clone)]
 struct GpuState {
     pieces: [i32; 64],
+    markers: [i32; 64],
     status: [f32; 4],
+    moving_piece_state: [f32; 4],
+    moving_piece: [i32; 4],
 }
 
 unsafe impl Zeroable for GpuState {}
 unsafe impl Pod for GpuState {}
 
 impl GpuState {
-    fn new(position: &Position, engine_is_thinking: bool, animation_time_seconds: f32) -> GpuState {
+    fn new(
+        position: &Position,
+        selected_square: Option<Square>,
+        legal_move_destinations: u64,
+        moving_piece: Option<MovingPieceVisual>,
+        engine_is_thinking: bool,
+        animation_time_seconds: f32,
+    ) -> GpuState {
         let mut board = GpuState {
             pieces: [0; 64],
+            markers: [0; 64],
             status: [
                 if engine_is_thinking { 1.0 } else { 0.0 },
                 animation_time_seconds,
                 0.0,
                 0.0,
             ],
+            moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
+            moving_piece: [0; 4],
         };
         for square in 0..64 {
             board.pieces[square] = position.piece_at(square as Square) as i32;
+            if (legal_move_destinations & (1u64 << square)) != 0 {
+                board.markers[square] = 1;
+            }
+        }
+
+        if let Some(square) = selected_square {
+            board.markers[square as usize] = 2;
+        }
+
+        if let Some(moving_piece) = moving_piece {
+            board.pieces[moving_piece.origin as usize] = Piece::Empty as i32;
+            board.moving_piece_state = [
+                1.0,
+                moving_piece.board_position[0],
+                moving_piece.board_position[1],
+                MOVING_PIECE_SMOOTH_UNION_RADIUS,
+            ];
+            board.moving_piece = [
+                moving_piece.piece as i32,
+                moving_piece.target as i32,
+                moving_piece.captured_piece as i32,
+                0,
+            ];
         }
         board
     }
@@ -86,14 +299,25 @@ fn animation_time_seconds(start_time_ms: f64) -> f32 {
     ((js_sys::Date::now() - start_time_ms) / 1000.0) as f32
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_gpu_state(
     queue: &wgpu::Queue,
     uniform_buf: &wgpu::Buffer,
     position: &Position,
+    selected_square: Option<Square>,
+    legal_move_destinations: u64,
+    moving_piece: Option<MovingPieceVisual>,
     engine_is_thinking: bool,
     animation_time_seconds: f32,
 ) {
-    let gpu_state = GpuState::new(position, engine_is_thinking, animation_time_seconds);
+    let gpu_state = GpuState::new(
+        position,
+        selected_square,
+        legal_move_destinations,
+        moving_piece,
+        engine_is_thinking,
+        animation_time_seconds,
+    );
     queue.write_buffer(uniform_buf, 0, gpu_state.as_byte_slice());
 }
 
@@ -450,7 +674,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let engine_driver = EngineDriver::new(event_loop.create_proxy());
     let mut position = Position::new();
     let mut position_history = vec![position.history_hash()];
-    let gpu_state = GpuState::new(&position, false, 0.0);
+    let gpu_state = GpuState::new(&position, None, 0, None, false, 0.0);
 
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Uniform Buffer"),
@@ -526,9 +750,9 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
     let animation_loop = AnimationLoop::new(event_loop.create_proxy());
 
     let mut current_mouse_pos = None;
-    let mut mouse_index = 0;
-    let mut mouse_positions = [PhysicalPosition::default(); 2];
-    let mut pending_move_selection = false;
+    let mut selected_square = None;
+    let mut selected_moves_mask = 0u64;
+    let mut move_animation: Option<MoveAnimation> = None;
     let mut engine_is_thinking = false;
     let mut game_over = false;
     let mut thinking_started_time_seconds = 0.0f32;
@@ -543,7 +767,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            *control_flow = if engine_is_thinking {
+            *control_flow = if engine_is_thinking || move_animation.is_some() {
                 ControlFlow::Poll
             } else {
                 ControlFlow::Wait
@@ -556,28 +780,95 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
         match event {
             #[cfg(target_arch = "wasm32")]
             Event::UserEvent(AppEvent::AnimationTick) => {
-                if engine_is_thinking {
-                    let thinking_elapsed =
-                        animation_time_seconds(animation_start) - thinking_started_time_seconds;
+                let now_seconds = animation_time_seconds(animation_start);
+                let mut completed_animation = false;
+                if let Some(active_animation) = move_animation {
+                    if now_seconds - active_animation.started_time_seconds
+                        >= move_animation_duration(active_animation)
+                    {
+                        move_animation = None;
+                        position.do_move(active_animation.move_to_apply);
+                        position_history.push(position.history_hash());
+                        game_over = is_draw_by_rule(&position, &position_history);
+                        completed_animation = true;
+                        if active_animation.start_engine_after && !game_over {
+                            engine_is_thinking = true;
+                            thinking_started_time_seconds = now_seconds;
+                            active_request_id = active_request_id.wrapping_add(1);
+                            sync_debug_state(&position, engine_is_thinking, active_request_id);
+                            engine_driver.request_move(
+                                active_request_id,
+                                position,
+                                &position_history,
+                            );
+                        } else {
+                            sync_debug_state(&position, engine_is_thinking, active_request_id);
+                        }
+                    }
+                }
+
+                if engine_is_thinking || move_animation.is_some() || completed_animation {
+                    let thinking_elapsed = if engine_is_thinking {
+                        now_seconds - thinking_started_time_seconds
+                    } else {
+                        0.0
+                    };
                     write_gpu_state(
                         &queue,
                         &uniform_buf,
                         &position,
+                        selected_square,
+                        selected_moves_mask,
+                        move_animation
+                            .map(|animation| move_animation_visual(animation, now_seconds)),
                         engine_is_thinking,
                         thinking_elapsed,
                     );
                     window.request_redraw();
+                } else {
+                    animation_loop.stop();
                 }
             }
             #[cfg(not(target_arch = "wasm32"))]
             Event::MainEventsCleared => {
-                if engine_is_thinking {
-                    let thinking_elapsed =
-                        animation_time_seconds(animation_start) - thinking_started_time_seconds;
+                let now_seconds = animation_time_seconds(animation_start);
+                let mut completed_animation = false;
+                if let Some(active_animation) = move_animation {
+                    if now_seconds - active_animation.started_time_seconds
+                        >= move_animation_duration(active_animation)
+                    {
+                        move_animation = None;
+                        position.do_move(active_animation.move_to_apply);
+                        position_history.push(position.history_hash());
+                        game_over = is_draw_by_rule(&position, &position_history);
+                        completed_animation = true;
+                        if active_animation.start_engine_after && !game_over {
+                            engine_is_thinking = true;
+                            thinking_started_time_seconds = now_seconds;
+                            active_request_id = active_request_id.wrapping_add(1);
+                            engine_driver.request_move(
+                                active_request_id,
+                                position,
+                                position_history.clone(),
+                            );
+                        }
+                    }
+                }
+
+                if engine_is_thinking || move_animation.is_some() || completed_animation {
+                    let thinking_elapsed = if engine_is_thinking {
+                        now_seconds - thinking_started_time_seconds
+                    } else {
+                        0.0
+                    };
                     write_gpu_state(
                         &queue,
                         &uniform_buf,
                         &position,
+                        selected_square,
+                        selected_moves_mask,
+                        move_animation
+                            .map(|animation| move_animation_visual(animation, now_seconds)),
                         engine_is_thinking,
                         thinking_elapsed,
                     );
@@ -593,19 +884,40 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 }
 
                 engine_is_thinking = false;
-                #[cfg(target_arch = "wasm32")]
-                animation_loop.stop();
+                selected_square = None;
+                selected_moves_mask = 0;
                 if let Some(best_move) = best_move {
-                    position.do_move(best_move);
-                    position_history.push(position.history_hash());
-                    game_over = is_draw_by_rule(&position, &position_history);
+                    let now_seconds = animation_time_seconds(animation_start);
+                    let origin = move_origin_square(best_move);
+                    move_animation = Some(MoveAnimation {
+                        from: origin,
+                        to: move_destination_square(best_move),
+                        piece: position.piece_at(origin),
+                        captured_piece: position.piece_at(move_destination_square(best_move)),
+                        move_to_apply: best_move,
+                        started_time_seconds: now_seconds,
+                        start_engine_after: false,
+                    });
                 } else {
+                    move_animation = None;
                     game_over = true;
+                    #[cfg(target_arch = "wasm32")]
+                    animation_loop.stop();
+                    #[cfg(target_arch = "wasm32")]
+                    sync_debug_state(&position, engine_is_thinking, active_request_id);
                 }
-                write_gpu_state(&queue, &uniform_buf, &position, engine_is_thinking, 0.0);
+                let now_seconds = animation_time_seconds(animation_start);
+                write_gpu_state(
+                    &queue,
+                    &uniform_buf,
+                    &position,
+                    selected_square,
+                    selected_moves_mask,
+                    move_animation.map(|animation| move_animation_visual(animation, now_seconds)),
+                    engine_is_thinking,
+                    0.0,
+                );
                 window.request_redraw();
-                #[cfg(target_arch = "wasm32")]
-                sync_debug_state(&position, engine_is_thinking, active_request_id);
             }
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
@@ -620,80 +932,75 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                 event: WindowEvent::MouseInput { button, state, .. },
                 ..
             } => {
-                if button == MouseButton::Left && !engine_is_thinking && !game_over {
-                    if state == winit::event::ElementState::Released {
-                        if let Some(mouse_pos) = current_mouse_pos {
-                            mouse_positions[mouse_index] = mouse_pos;
-                            pending_move_selection = mouse_index == 1;
-                            mouse_index = (mouse_index + 1) % 2;
-                        }
-                    }
+                if button != MouseButton::Left
+                    || state != winit::event::ElementState::Released
+                    || engine_is_thinking
+                    || move_animation.is_some()
+                    || game_over
+                {
+                    return;
+                }
 
-                    if pending_move_selection {
-                        pending_move_selection = false;
-                        let window_size = window.inner_size();
-                        if let (Some(from), Some(to)) = (
-                            mouse_to_square(mouse_positions[0], window_size),
-                            mouse_to_square(mouse_positions[1], window_size),
-                        ) {
-                            if try_player_move(&mut position, from, to) {
-                                position_history.push(position.history_hash());
-                                game_over = is_draw_by_rule(&position, &position_history);
+                let window_size = window.inner_size();
+                let clicked_square =
+                    current_mouse_pos.and_then(|mouse_pos| mouse_to_square(mouse_pos, window_size));
 
-                                if !game_over {
-                                    engine_is_thinking = true;
-                                    // Reset the pulse phase so black pieces always start fully opaque.
-                                    thinking_started_time_seconds =
-                                        animation_time_seconds(animation_start);
-                                    active_request_id = active_request_id.wrapping_add(1);
-                                    #[cfg(target_arch = "wasm32")]
-                                    animation_loop.start();
-                                    write_gpu_state(
-                                        &queue,
-                                        &uniform_buf,
-                                        &position,
-                                        engine_is_thinking,
-                                        0.0,
-                                    );
-                                    window.request_redraw();
-                                    #[cfg(target_arch = "wasm32")]
-                                    sync_debug_state(
-                                        &position,
-                                        engine_is_thinking,
-                                        active_request_id,
-                                    );
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    engine_driver.request_move(
-                                        active_request_id,
-                                        position,
-                                        position_history.clone(),
-                                    );
-                                    #[cfg(target_arch = "wasm32")]
-                                    engine_driver.request_move(
-                                        active_request_id,
-                                        position,
-                                        &position_history,
-                                    );
-                                } else {
-                                    write_gpu_state(
-                                        &queue,
-                                        &uniform_buf,
-                                        &position,
-                                        engine_is_thinking,
-                                        0.0,
-                                    );
-                                    window.request_redraw();
-                                    #[cfg(target_arch = "wasm32")]
-                                    sync_debug_state(
-                                        &position,
-                                        engine_is_thinking,
-                                        active_request_id,
-                                    );
-                                }
+                if let Some(clicked_square) = clicked_square {
+                    if selected_square == Some(clicked_square) {
+                        selected_square = None;
+                        selected_moves_mask = 0;
+                    } else if is_selectable_piece(&position, clicked_square) {
+                        selected_square = Some(clicked_square);
+                        selected_moves_mask = legal_move_destinations(&position, clicked_square);
+                    } else if let Some(from) = selected_square {
+                        if (selected_moves_mask & (1u64 << clicked_square)) != 0 {
+                            if let Some(move_to_apply) =
+                                player_move(&position, from, clicked_square)
+                            {
+                                let now_seconds = animation_time_seconds(animation_start);
+                                move_animation = Some(MoveAnimation {
+                                    from,
+                                    to: clicked_square,
+                                    piece: position.piece_at(from),
+                                    captured_piece: position.piece_at(clicked_square),
+                                    move_to_apply,
+                                    started_time_seconds: now_seconds,
+                                    start_engine_after: true,
+                                });
+                                selected_square = None;
+                                selected_moves_mask = 0;
+                                #[cfg(target_arch = "wasm32")]
+                                animation_loop.start();
+                                write_gpu_state(
+                                    &queue,
+                                    &uniform_buf,
+                                    &position,
+                                    selected_square,
+                                    selected_moves_mask,
+                                    move_animation.map(|animation| {
+                                        move_animation_visual(animation, now_seconds)
+                                    }),
+                                    engine_is_thinking,
+                                    0.0,
+                                );
+                                window.request_redraw();
+                                return;
                             }
                         }
                     }
                 }
+
+                write_gpu_state(
+                    &queue,
+                    &uniform_buf,
+                    &position,
+                    selected_square,
+                    selected_moves_mask,
+                    None,
+                    engine_is_thinking,
+                    0.0,
+                );
+                window.request_redraw();
             }
             Event::WindowEvent {
                 event: WindowEvent::CursorMoved { position, .. },

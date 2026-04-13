@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader},
     process,
+    time::Instant,
 };
 
 fn print_usage(binary: &str) {
@@ -85,7 +86,12 @@ fn main() {
     match args.next() {
         None => {
             let position = parse_position(None);
-            println!("{}", perft(&position, depth));
+            let start = Instant::now();
+            let nodes = perft(&position, depth);
+            let seconds = start.elapsed().as_secs_f64();
+            let nps = nodes as f64 / seconds.max(1e-9);
+
+            println!("depth {depth}: nodes={nodes} time={seconds:.3}s nps={nps:.0}");
         }
         Some(flag) if flag == "--file" => {
             let Some(path) = args.next() else {
@@ -104,7 +110,12 @@ fn main() {
                 process::exit(2);
             }
             let position = parse_position(Some(fen));
-            println!("{}", perft(&position, depth));
+            let start = Instant::now();
+            let nodes = perft(&position, depth);
+            let seconds = start.elapsed().as_secs_f64();
+            let nps = nodes as f64 / seconds.max(1e-9);
+
+            println!("depth {depth}: nodes={nodes} time={seconds:.3}s nps={nps:.0}");
         }
     }
 }

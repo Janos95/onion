@@ -4,7 +4,10 @@ alias v4 = vec4<f32>;
 
 struct uniforms {
     pieces: array<vec4<i32>, 16>,
+    markers: array<vec4<i32>, 16>,
     status: vec4<f32>,
+    moving_piece_state: vec4<f32>,
+    moving_piece: vec4<i32>,
 };
 
 @group(0)
@@ -55,6 +58,11 @@ fn dot2(p : v2) -> f32
 fn sd_circle(p : v2, r : f32) -> f32
 {
     return length(p) - r;
+}
+
+fn ease(x : f32) -> f32
+{
+    return x * x * (3.0 - 2.0 * x);
 }
 
 fn sd_box(p : v2, b : v2) -> f32
@@ -159,6 +167,11 @@ fn op_smooth_union(d1 : f32, d2 : f32, k : f32) -> f32
 {
     let h = clamp(0.5 + 0.5*(d2-d1)/k, 0.0, 1.0 );
     return mix(d2, d1, h) - k*h*(1.0-h); 
+}
+
+fn op_smooth_union_blend(d1 : f32, d2 : f32, k : f32) -> f32
+{
+    return clamp(0.5 + 0.5*(d2-d1)/k, 0.0, 1.0 );
 }
 
 fn op_union(d1 : f32, d2 : f32) -> f32
@@ -268,6 +281,10 @@ fn king(p : v2) -> f32
 
 fn piece_color(square_id : i32) -> v3 {
     let piece = state.pieces[square_id / 4][square_id % 4];
+    return piece_color_from_code(piece);
+}
+
+fn piece_color_from_code(piece : i32) -> v3 {
     let is_even = (piece & 1) == 0;
     if is_even {
         // black
@@ -275,6 +292,10 @@ fn piece_color(square_id : i32) -> v3 {
     }
     // white
     return pow(v3(248.,248.,248.) / 255., v3(2.2));
+}
+
+fn square_marker(square_id : i32) -> i32 {
+    return state.markers[square_id / 4][square_id % 4];
 }
 
 fn square_color(i : i32, j : i32) -> v3 {
@@ -287,6 +308,10 @@ fn square_color(i : i32, j : i32) -> v3 {
 
 fn dispatch_piece(p : v2, square_id : i32) -> f32 {
     let piece = state.pieces[square_id / 4][square_id % 4];
+    return dispatch_piece_code(p, piece);
+}
+
+fn dispatch_piece_code(p : v2, piece : i32) -> f32 {
     if piece == 0 {
         return 1.;
     }
@@ -307,7 +332,7 @@ fn dispatch_piece(p : v2, square_id : i32) -> f32 {
 fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let uv = vertex.tex_coord;
     let thinking = state.status.x;
-    let pulse_strength = 0.5 + 0.5 * cos(state.status.y * 4.19);
+    let pulse_strength = 0.5 - 0.5 * cos(state.status.y * 4.19);
     let a = 1. / 8.;
     let x = uv.x / a;
     let y = uv.y / a;
@@ -323,22 +348,88 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let p = v2(px, py);
 
     let square_id = 8 * j + i;
-    let d = dispatch_piece(p, square_id);
+    let d_base = dispatch_piece(p, square_id);
     let piece = state.pieces[square_id / 4][square_id % 4];
     let is_black_piece = piece != 0 && (piece & 1) == 0;
+    let d = d_base;
+    let marker = square_marker(square_id);
+    let is_selected_piece = marker == 2;
     let square = square_color(i, j);
+    let selected_outline = pow(v3(207., 158., 84.) / 255., v3(2.2));
+    let move_disk = pow(v3(150., 150., 150.) / 255., v3(2.2));
+    let disk_distance = length(p) - 0.2;
+    let disk_aa = max(fwidth(disk_distance), 0.002);
+    let disk_strength = 1.0 - smoothstep(0.0, disk_aa, disk_distance);
+    let moving_piece_active = state.moving_piece_state.x > 0.5;
+    let moving_piece_center = state.moving_piece_state.yz;
+    let blend_k = state.moving_piece_state.w;
+    let moving_piece = state.moving_piece.x;
+    let moving_piece_target_square = state.moving_piece.y;
+    let captured_piece = state.moving_piece.z;
+    let d_moving = dispatch_piece_code(2.0 * (v2(x, y) - moving_piece_center), moving_piece);
+    let moving_piece_color = piece_color_from_code(moving_piece);
+    let target_center = v2(
+        f32(moving_piece_target_square % 8) + 0.5,
+        f32(moving_piece_target_square / 8) + 0.5,
+    );
+    let overlap_x = max(0.0, 1.0 - abs(moving_piece_center.x - target_center.x));
+    let overlap_y = max(0.0, 1.0 - abs(moving_piece_center.y - target_center.y));
+    let capture_overlap = select(0.0, ease(clamp(overlap_x * overlap_y, 0.0, 1.0)), captured_piece != 0);
+    let capture_morph = capture_overlap * capture_overlap;
+    let is_capture_target_square =
+        captured_piece != 0 && i32(moving_piece_target_square) == square_id;
+    let board_color = piece_color(square_id);
+    let black_piece_alpha = select(1.0, 1.0 - 0.25 * thinking * pulse_strength, is_black_piece);
+    let board_piece_color = mix(square, board_color, black_piece_alpha);
+    let board_component_color = select(square, board_piece_color, piece != 0);
+    let moving_piece_blend = select(
+        1.0,
+        op_smooth_union_blend(d, d_moving, blend_k),
+        moving_piece_active,
+    );
+    let d_moving_at_target = dispatch_piece_code(p, moving_piece);
+    let capture_target_b_morph = mix(d, d_moving_at_target, capture_morph);
+    let capture_union_taper = smoothstep(0.5, 1.0, capture_overlap);
+    let capture_target_d = mix(
+        op_smooth_union(d_moving, capture_target_b_morph, blend_k),
+        op_union(d_moving, capture_target_b_morph),
+        capture_union_taper,
+    );
+    let d_composed = select(
+        select(d, op_smooth_union(d, d_moving, blend_k), moving_piece_active),
+        capture_target_d,
+        is_capture_target_square,
+    );
+    let capture_target_b_morph_color = mix(board_component_color, moving_piece_color, capture_morph);
+    let capture_target_color = capture_target_b_morph_color;
+    let normal_move_color = mix(moving_piece_color, board_component_color, moving_piece_blend);
+    let base_piece_color = select(
+        normal_move_color,
+        capture_target_color,
+        is_capture_target_square,
+    );
+
     var col : v3;
-    if d < 0.0 {
-        col = piece_color(square_id);
-        if is_black_piece {
-            let piece_alpha = mix(1.0, 0.6 + 0.4 * pulse_strength, thinking);
-            col = mix(square, col, piece_alpha);
-        }
+    if d_composed < 0.0 {
+        col = base_piece_color;
     }
     else {
         col = square;
     }
-    col = mix(col, vec3(0.0), 1.0-smoothstep(0.0,0.03,abs(d)) );
+
+    if marker == 1 {
+        let disk_alpha = select(0.9, 0.85, piece != 0);
+        col = mix(col, move_disk, disk_strength * disk_alpha);
+    }
+
+    let outline_width = 3.0 * max(fwidth(d_composed), 0.002);
+    let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_composed));
+    let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
+    col = mix(col, outline_color, outline);
+
+    if marker == 1 {
+        col = mix(col, move_disk, disk_strength * 0.25);
+    }
 
     return v4(col.x, col.y, col.z, 1.);
 }
