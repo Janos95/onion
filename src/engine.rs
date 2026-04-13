@@ -1313,9 +1313,13 @@ pub fn legal_move_destinations(position: &Position, origin: Square) -> u64 {
     destinations
 }
 
+pub fn player_move(position: &Position, origin: Square, destination: Square) -> Option<Move> {
+    let mut scratch = *position;
+    generate_legal_moves(&mut scratch).find(origin, destination)
+}
+
 pub fn try_player_move(position: &mut Position, origin: Square, destination: Square) -> bool {
-    let legal_moves = generate_legal_moves(position);
-    if let Some(m) = legal_moves.find(origin, destination) {
+    if let Some(m) = player_move(position, origin, destination) {
         position.do_move(m);
         true
     } else {

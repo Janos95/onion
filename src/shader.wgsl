@@ -6,6 +6,8 @@ struct uniforms {
     pieces: array<vec4<i32>, 16>,
     markers: array<vec4<i32>, 16>,
     status: vec4<f32>,
+    moving_piece_state: vec4<f32>,
+    moving_piece: vec4<i32>,
 };
 
 @group(0)
@@ -162,6 +164,11 @@ fn op_smooth_union(d1 : f32, d2 : f32, k : f32) -> f32
     return mix(d2, d1, h) - k*h*(1.0-h); 
 }
 
+fn op_smooth_union_blend(d1 : f32, d2 : f32, k : f32) -> f32
+{
+    return clamp(0.5 + 0.5*(d2-d1)/k, 0.0, 1.0 );
+}
+
 fn op_union(d1 : f32, d2 : f32) -> f32
 { 
     return min(d1,d2); 
@@ -269,6 +276,10 @@ fn king(p : v2) -> f32
 
 fn piece_color(square_id : i32) -> v3 {
     let piece = state.pieces[square_id / 4][square_id % 4];
+    return piece_color_from_code(piece);
+}
+
+fn piece_color_from_code(piece : i32) -> v3 {
     let is_even = (piece & 1) == 0;
     if is_even {
         // black
@@ -292,6 +303,10 @@ fn square_color(i : i32, j : i32) -> v3 {
 
 fn dispatch_piece(p : v2, square_id : i32) -> f32 {
     let piece = state.pieces[square_id / 4][square_id % 4];
+    return dispatch_piece_code(p, piece);
+}
+
+fn dispatch_piece_code(p : v2, piece : i32) -> f32 {
     if piece == 0 {
         return 1.;
     }
@@ -312,7 +327,7 @@ fn dispatch_piece(p : v2, square_id : i32) -> f32 {
 fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let uv = vertex.tex_coord;
     let thinking = state.status.x;
-    let pulse_strength = 0.5 + 0.5 * cos(state.status.y * 4.19);
+    let pulse_strength = 0.5 - 0.5 * cos(state.status.y * 4.19);
     let a = 1. / 8.;
     let x = uv.x / a;
     let y = uv.y / a;
@@ -328,9 +343,11 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let p = v2(px, py);
 
     let square_id = 8 * j + i;
-    let d = dispatch_piece(p, square_id);
+    let d_base = dispatch_piece(p, square_id);
     let piece = state.pieces[square_id / 4][square_id % 4];
     let is_black_piece = piece != 0 && (piece & 1) == 0;
+    let black_growth = thinking * 3.0 * max(fwidth(d_base), 0.002) * pulse_strength;
+    let d = select(d_base, d_base - black_growth, is_black_piece);
     let marker = square_marker(square_id);
     let is_selected_piece = marker == 2;
     let square = square_color(i, j);
@@ -339,13 +356,32 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
     let disk_distance = length(p) - 0.2;
     let disk_aa = max(fwidth(disk_distance), 0.002);
     let disk_strength = 1.0 - smoothstep(0.0, disk_aa, disk_distance);
+    let moving_piece_active = state.moving_piece_state.x > 0.5;
+    let moving_piece_center = state.moving_piece_state.yz;
+    let capture_progress = state.moving_piece_state.w;
+    let moving_piece = state.moving_piece.x;
+    let moving_piece_target_square = state.moving_piece.y;
+    let captured_piece = state.moving_piece.z;
+    let d_moving = dispatch_piece_code(2.0 * (v2(x, y) - moving_piece_center), moving_piece);
+    let moving_piece_color = piece_color_from_code(moving_piece);
+    let blend_k = 0.35;
+    let d_composed = select(d, op_smooth_union(d, d_moving, blend_k), moving_piece_active);
+    let board_color = piece_color(square_id);
+    let board_component_color = select(square, board_color, piece != 0);
+    let moving_piece_band = 8.0 * max(fwidth(d_moving), 0.002);
+    let moving_piece_base_alpha = select(
+        0.0,
+        1.0 - smoothstep(-moving_piece_band, moving_piece_band, d_moving),
+        moving_piece_active,
+    );
+    let capture_square_match = i32(moving_piece_target_square) == square_id;
+    let capture_alpha = select(1.0, capture_progress, capture_square_match && captured_piece != 0);
+    let moving_piece_color_alpha = moving_piece_base_alpha * capture_alpha;
+    let base_piece_color = mix(board_component_color, moving_piece_color, moving_piece_color_alpha);
+
     var col : v3;
-    if d < 0.0 {
-        col = piece_color(square_id);
-        if is_black_piece {
-            let piece_alpha = mix(1.0, 0.6 + 0.4 * pulse_strength, thinking);
-            col = mix(square, col, piece_alpha);
-        }
+    if d_composed < 0.0 {
+        col = base_piece_color;
     }
     else {
         col = square;
@@ -356,8 +392,10 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
         col = mix(col, move_disk, disk_strength * disk_alpha);
     }
 
+    let outline_width = 3.0 * max(fwidth(d_composed), 0.002);
+    let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_composed));
     let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
-    col = mix(col, outline_color, 1.0 - smoothstep(0.0, 0.03, abs(d)));
+    col = mix(col, outline_color, outline);
 
     return v4(col.x, col.y, col.z, 1.);
 }
