@@ -141,12 +141,17 @@ fn move_animation_duration(animation: MoveAnimation) -> f32 {
     }
 }
 
-fn move_path_position(animation: MoveAnimation, progress: f32) -> [f32; 2] {
-    let from = square_center(animation.from);
-    let to = square_center(animation.to);
+fn move_path_between(
+    piece: Piece,
+    from_square: Square,
+    to_square: Square,
+    progress: f32,
+) -> [f32; 2] {
+    let from = square_center(from_square);
+    let to = square_center(to_square);
     let dx = to[0] - from[0];
     let dy = to[1] - from[1];
-    let is_knight = matches!(animation.piece, Piece::WhiteKnight | Piece::BlackKnight);
+    let is_knight = matches!(piece, Piece::WhiteKnight | Piece::BlackKnight);
     if is_knight {
         let (corner, first_leg_fraction) = if dx.abs() > dy.abs() {
             ([to[0], from[1]], 2.0 / 3.0)
@@ -172,6 +177,10 @@ fn move_path_position(animation: MoveAnimation, progress: f32) -> [f32; 2] {
     }
 }
 
+fn move_path_position(animation: MoveAnimation, progress: f32) -> [f32; 2] {
+    move_path_between(animation.piece, animation.from, animation.to, progress)
+}
+
 fn square_boxes_touch(position: [f32; 2], target_center: [f32; 2]) -> bool {
     (position[0] - target_center[0]).abs() <= 1.0 && (position[1] - target_center[1]).abs() <= 1.0
 }
@@ -191,19 +200,22 @@ fn capture_contact_path_progress(animation: MoveAnimation) -> f32 {
     high
 }
 
-fn move_animation_visual(animation: MoveAnimation, now_seconds: f32) -> MovingPieceVisual {
+fn move_animation_path_progress(animation: MoveAnimation, now_seconds: f32) -> f32 {
     let raw_progress = ((now_seconds - animation.started_time_seconds)
         / move_animation_duration(animation))
     .clamp(0.0, 1.0);
-    let path_progress = if animation.captured_piece != Piece::Empty {
+    if animation.captured_piece != Piece::Empty {
         let contact_path_progress = capture_contact_path_progress(animation);
         let contact_time_fraction =
             CAPTURE_CONTACT_TIME_SECONDS / CAPTURE_MOVE_ANIMATION_DURATION_SECONDS;
         smooth_capture_path_progress(raw_progress, contact_time_fraction, contact_path_progress)
     } else {
         eased_progress(raw_progress)
-    };
+    }
+}
 
+fn move_animation_visual(animation: MoveAnimation, now_seconds: f32) -> MovingPieceVisual {
+    let path_progress = move_animation_path_progress(animation, now_seconds);
     MovingPieceVisual {
         origin: animation.from,
         piece: animation.piece,
@@ -211,6 +223,34 @@ fn move_animation_visual(animation: MoveAnimation, now_seconds: f32) -> MovingPi
         target: animation.to,
         captured_piece: animation.captured_piece,
     }
+}
+
+fn castling_rook_visual(animation: MoveAnimation, now_seconds: f32) -> Option<MovingPieceVisual> {
+    if !matches!(animation.piece, Piece::WhiteKing | Piece::BlackKing)
+        || animation.captured_piece != Piece::Empty
+        || animation.from / 8 != animation.to / 8
+        || i32::abs(animation.to as i32 - animation.from as i32) != 2
+    {
+        return None;
+    }
+
+    let rank = animation.from / 8;
+    let (origin, target, piece) = match (animation.piece, animation.to > animation.from) {
+        (Piece::WhiteKing, true) => (rank * 8 + 7, rank * 8 + 5, Piece::WhiteRook),
+        (Piece::WhiteKing, false) => (rank * 8 + 0, rank * 8 + 3, Piece::WhiteRook),
+        (Piece::BlackKing, true) => (rank * 8 + 7, rank * 8 + 5, Piece::BlackRook),
+        (Piece::BlackKing, false) => (rank * 8 + 0, rank * 8 + 3, Piece::BlackRook),
+        _ => return None,
+    };
+
+    let path_progress = move_animation_path_progress(animation, now_seconds);
+    Some(MovingPieceVisual {
+        origin,
+        piece,
+        board_position: move_path_between(piece, origin, target, path_progress),
+        target,
+        captured_piece: Piece::Empty,
+    })
 }
 
 fn move_origin_square(m: Move) -> Square {
@@ -241,6 +281,7 @@ struct RenderState {
     selected_square: Option<Square>,
     legal_move_destinations: u64,
     moving_piece: Option<MovingPieceVisual>,
+    secondary_moving_piece: Option<MovingPieceVisual>,
     engine_is_thinking: bool,
     animation_time_seconds: f32,
 }
@@ -285,6 +326,21 @@ impl GpuState {
                 MOVING_PIECE_SMOOTH_UNION_RADIUS,
             ];
             board.moving_piece = [
+                moving_piece.piece as i32,
+                moving_piece.target as i32,
+                moving_piece.captured_piece as i32,
+                0,
+            ];
+        }
+        if let Some(moving_piece) = render_state.secondary_moving_piece {
+            board.pieces[moving_piece.origin as usize] = Piece::Empty as i32;
+            board.secondary_moving_piece_state = [
+                1.0,
+                moving_piece.board_position[0],
+                moving_piece.board_position[1],
+                MOVING_PIECE_SMOOTH_UNION_RADIUS,
+            ];
+            board.secondary_moving_piece = [
                 moving_piece.piece as i32,
                 moving_piece.target as i32,
                 moving_piece.captured_piece as i32,
@@ -678,6 +734,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
             selected_square: None,
             legal_move_destinations: 0,
             moving_piece: None,
+            secondary_moving_piece: None,
             engine_is_thinking: false,
             animation_time_seconds: 0.0,
         },
@@ -827,8 +884,12 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         RenderState {
                             selected_square,
                             legal_move_destinations: selected_moves_mask,
-                            moving_piece: move_animation
-                                .map(|animation| move_animation_visual(animation, now_seconds)),
+                            moving_piece: move_animation.map(|animation| {
+                                move_animation_visual(animation, now_seconds)
+                            }),
+                            secondary_moving_piece: move_animation.and_then(|animation| {
+                                castling_rook_visual(animation, now_seconds)
+                            }),
                             engine_is_thinking,
                             animation_time_seconds: thinking_elapsed,
                         },
@@ -877,8 +938,12 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         RenderState {
                             selected_square,
                             legal_move_destinations: selected_moves_mask,
-                            moving_piece: move_animation
-                                .map(|animation| move_animation_visual(animation, now_seconds)),
+                            moving_piece: move_animation.map(|animation| {
+                                move_animation_visual(animation, now_seconds)
+                            }),
+                            secondary_moving_piece: move_animation.and_then(|animation| {
+                                castling_rook_visual(animation, now_seconds)
+                            }),
                             engine_is_thinking,
                             animation_time_seconds: thinking_elapsed,
                         },
@@ -927,6 +992,8 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         legal_move_destinations: selected_moves_mask,
                         moving_piece: move_animation
                             .map(|animation| move_animation_visual(animation, now_seconds)),
+                        secondary_moving_piece: move_animation
+                            .and_then(|animation| castling_rook_visual(animation, now_seconds)),
                         engine_is_thinking,
                         animation_time_seconds: 0.0,
                     },
@@ -995,6 +1062,9 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                                         moving_piece: move_animation.map(|animation| {
                                             move_animation_visual(animation, now_seconds)
                                         }),
+                                        secondary_moving_piece: move_animation.and_then(
+                                            |animation| castling_rook_visual(animation, now_seconds),
+                                        ),
                                         engine_is_thinking,
                                         animation_time_seconds: 0.0,
                                     },
@@ -1014,6 +1084,7 @@ async fn run(event_loop: EventLoop<AppEvent>, window: Window) {
                         selected_square,
                         legal_move_destinations: selected_moves_mask,
                         moving_piece: None,
+                        secondary_moving_piece: None,
                         engine_is_thinking,
                         animation_time_seconds: 0.0,
                     },
