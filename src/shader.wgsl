@@ -73,6 +73,16 @@ fn sd_ellipse(p : v2, r : v2) -> f32
     return k0 * (k0 - 1.0) / k1;
 }
 
+fn sd_arc(p1 : v2, sc : v2, ra : f32, rb : f32) -> f32
+{
+    var p = p1;
+    p.x = abs(p.x);
+    if (sc.y * p.x > sc.x * p.y) {
+        return length(p - sc * ra) - rb;
+    }
+    return abs(length(p) - ra) - rb;
+}
+
 fn ease(x : f32) -> f32
 {
     return x * x * (3.0 - 2.0 * x);
@@ -234,10 +244,15 @@ fn pawn(p : v2) -> f32
 
 fn knight(p : v2) -> f32 {
     let bottom = sd_rounded_box(p + v2(0., 0.72), v2(0.58, 0.14), v4(0.14,0.,0.14,0.));
-    let head = sd_oriented_box(p, v2(-0.5, -0.1), v2(-0.1, 0.4), 0.1) - 0.1;
-    let head_disk = sd_ellipse(rotate(p - v2(0.1, -0.2), -0.2), v2(0.3, 0.6));
-    let ear = sd_triangle(p, v2(-0.2, 0.45), v2(-0.1, 0.45), v2(-0.15, 0.6)) - 0.05;
-    return op_union(op_union(op_union(bottom, head), head_disk), ear);
+    let head = sd_oriented_box(p, v2(-0.60, -0.03), v2(-0.20, 0.47), 0.12) - 0.09;
+    // let chin = sd_ellipse(rotate(p - v2(-0.02, 0.08), -0.45), v2(0.16, 0.22));
+    let bridge = sd_arc(rotate(p - v2(-0.02, 0.14), -1.1), v2(0.8, 0.6), 0.3, 0.3);
+    let neck = sd_ellipse(rotate(p - v2(0.1, -0.3), -0.9), v2(0.3, 0.5));
+    let ear = sd_triangle(p, v2(-0.05, 0.7), v2(0.0, 0.7), v2(0.04, 0.87)) - 0.03;
+    let head_and_bridge = op_smooth_union(head, bridge, 0.25);
+    let top = op_smooth_union(head_and_bridge, ear, 0.15);
+    let upper = op_smooth_union(neck, top, 0.1);
+    return op_smooth_union(bottom, upper, 0.2);
 }
 
 fn bishop(p : v2) -> f32 {
