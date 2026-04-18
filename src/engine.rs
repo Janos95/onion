@@ -118,6 +118,9 @@ const KNIGHT_MOBILITY_BONUS: i32 = 4;
 const BISHOP_MOBILITY_BONUS: i32 = 4;
 const ROOK_MOBILITY_BONUS: i32 = 2;
 const QUEEN_MOBILITY_BONUS: i32 = 1;
+const PRIMARY_KILLER_BONUS: i32 = 7_000;
+const SECONDARY_KILLER_BONUS: i32 = 6_000;
+const MAX_HISTORY_BONUS: i32 = 4_000;
 
 #[cfg(not(target_arch = "wasm32"))]
 type SearchDeadline = Instant;
@@ -309,6 +312,12 @@ struct MoveIter<'a> {
     idx: usize,
 }
 
+#[derive(Copy, Clone)]
+struct SearchWindow {
+    alpha: i32,
+    beta: i32,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Bound {
     Empty,
@@ -345,10 +354,12 @@ struct TranspositionTable {
 
 pub struct Searcher {
     tt: TranspositionTable,
-    history: Vec<u64>,
+    repetition_history: Vec<u64>,
+    quiet_history: [[i32; 64]; 64],
+    killers: [[Move; 2]; MAX_SEARCH_DEPTH],
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum SearchAborted {
     Timeout,
 }
@@ -1375,19 +1386,106 @@ impl Searcher {
     pub fn new() -> Searcher {
         Searcher {
             tt: TranspositionTable::new(TT_SIZE),
-            history: Vec::new(),
+            repetition_history: Vec::new(),
+            quiet_history: [[0; 64]; 64],
+            killers: [[0; 2]; MAX_SEARCH_DEPTH],
         }
     }
 
     fn prepare_history(&mut self, position: &Position, position_history: &[u64]) {
-        self.history.clear();
+        self.repetition_history.clear();
         if position_history.is_empty() {
-            self.history.push(position.history_hash());
+            self.repetition_history.push(position.history_hash());
             return;
         }
 
         debug_assert_eq!(position_history.last(), Some(&position.history_hash()));
-        self.history.extend_from_slice(position_history);
+        self.repetition_history.extend_from_slice(position_history);
+    }
+
+    fn clear_move_ordering_heuristics(&mut self) {
+        self.quiet_history = [[0; 64]; 64];
+        self.killers = [[0; 2]; MAX_SEARCH_DEPTH];
+    }
+
+    fn quiet_history_score(&self, m: Move) -> i32 {
+        self.quiet_history[origin_square(m) as usize][destination_square(m) as usize]
+            .min(MAX_HISTORY_BONUS)
+    }
+
+    fn note_quiet_cutoff(&mut self, ply: usize, m: Move, depth: usize) {
+        let killers = &mut self.killers[ply.min(MAX_SEARCH_DEPTH - 1)];
+        if killers[0] != m {
+            killers[1] = killers[0];
+            killers[0] = m;
+        }
+
+        let bonus = (depth * depth) as i32;
+        let entry =
+            &mut self.quiet_history[origin_square(m) as usize][destination_square(m) as usize];
+        *entry = (*entry + bonus).min(32_000);
+    }
+
+    fn move_score(&self, position: &Position, m: Move, tt_move: Option<Move>, ply: usize) -> i32 {
+        if tt_move.is_some_and(|candidate| candidate == m) {
+            return i32::MAX;
+        }
+
+        let origin = origin_square(m);
+        let moving_piece = position.by_piece[origin as usize];
+        let captured_piece = if move_flag(m) == MoveFlag::EnPassant {
+            Piece::from_kind_color(PieceKind::Pawn, position.side_to_move.opposite())
+        } else {
+            position.by_piece[destination_square(m) as usize]
+        };
+
+        let mut score = 0;
+        if captured_piece != Piece::Empty {
+            score += 10_000;
+            score += piece_value(captured_piece.kind()) * 16 - piece_value(moving_piece.kind());
+        }
+        if let Some(kind) = promotion_kind(m) {
+            score += 8_000 + piece_value(kind);
+        }
+        if captured_piece == Piece::Empty && promotion_kind(m).is_none() {
+            let killers = self.killers[ply.min(MAX_SEARCH_DEPTH - 1)];
+            if killers[0] == m {
+                score += PRIMARY_KILLER_BONUS;
+            } else if killers[1] == m {
+                score += SECONDARY_KILLER_BONUS;
+            }
+            score += self.quiet_history_score(m);
+        }
+
+        score
+    }
+
+    fn order_moves(
+        &self,
+        position: &Position,
+        moves: &mut Moves,
+        tt_move: Option<Move>,
+        ply: usize,
+    ) {
+        let mut scores = [0; 256];
+        for (idx, score) in scores.iter_mut().enumerate().take(moves.num_moves) {
+            *score = self.move_score(position, moves.moves[idx], tt_move, ply);
+        }
+
+        for i in 1..moves.num_moves {
+            let move_to_insert = moves.moves[i];
+            let score_to_insert = scores[i];
+            let mut j = i;
+
+            while j > 0 && score_to_insert > scores[j - 1] {
+                moves.moves[j] = moves.moves[j - 1];
+                scores[j] = scores[j - 1];
+                j -= 1;
+            }
+
+            moves.moves[j] = move_to_insert;
+            scores[j] = score_to_insert;
+        }
     }
 
     pub fn make_move(&mut self, position: &mut Position, position_history: &[u64]) -> bool {
@@ -1409,7 +1507,8 @@ impl Searcher {
         depth: usize,
     ) -> Option<SearchStats> {
         self.prepare_history(position, position_history);
-        if is_draw_by_rule(position, &self.history) {
+        self.clear_move_ordering_heuristics();
+        if is_draw_by_rule(position, &self.repetition_history) {
             return Some(SearchStats::default());
         }
 
@@ -1427,7 +1526,8 @@ impl Searcher {
         time_budget: Duration,
     ) -> Option<(Move, SearchStats)> {
         self.prepare_history(position, position_history);
-        if is_draw_by_rule(position, &self.history) {
+        self.clear_move_ordering_heuristics();
+        if is_draw_by_rule(position, &self.repetition_history) {
             return None;
         }
 
@@ -1473,7 +1573,7 @@ impl Searcher {
             .tt
             .probe(position.tt_key())
             .map(|entry| entry.best_move);
-        order_moves(position, &mut moves, tt_move);
+        self.order_moves(position, &mut moves, tt_move, 0);
 
         let mut stats = SearchStats::default();
         let mut best_move = moves.moves[0];
@@ -1486,16 +1586,19 @@ impl Searcher {
                 return Err(SearchAborted::Timeout);
             }
             let undo = position.make_move_unchecked(m);
-            self.history.push(position.history_hash());
+            self.repetition_history.push(position.history_hash());
             let value = self.negamax(
                 position,
                 depth.saturating_sub(1),
-                -beta,
-                -alpha,
+                SearchWindow {
+                    alpha: -beta,
+                    beta: -alpha,
+                },
                 &mut stats,
                 deadline,
+                1,
             );
-            self.history.pop();
+            self.repetition_history.pop();
             position.undo_move_unchecked(m, undo);
             let value = -value?;
 
@@ -1525,24 +1628,26 @@ impl Searcher {
         &mut self,
         position: &mut Position,
         depth: usize,
-        mut alpha: i32,
-        beta: i32,
+        window: SearchWindow,
         stats: &mut SearchStats,
         deadline: Option<SearchDeadline>,
+        ply: usize,
     ) -> Result<i32, SearchAborted> {
+        let mut alpha = window.alpha;
+        let beta = window.beta;
+        if depth == 0 {
+            return self.quiescence(position, SearchWindow { alpha, beta }, stats, deadline, ply);
+        }
+
         stats.nodes += 1;
         if search_timed_out(deadline, stats.nodes) {
             return Err(SearchAborted::Timeout);
         }
-        if is_draw_by_rule(position, &self.history) {
+        if is_draw_by_rule(position, &self.repetition_history) {
             return Ok(0);
         }
 
         let original_alpha = alpha;
-        if depth == 0 {
-            return Ok(position.evaluate());
-        }
-
         let tt_entry = self.tt.probe(position.tt_key());
         if let Some(entry) = tt_entry {
             if entry.depth as usize >= depth {
@@ -1573,16 +1678,32 @@ impl Searcher {
             });
         }
 
-        order_moves(position, &mut moves, tt_entry.map(|entry| entry.best_move));
+        self.order_moves(
+            position,
+            &mut moves,
+            tt_entry.map(|entry| entry.best_move),
+            ply,
+        );
 
         let mut best_value = -CHECKMATE_SCORE;
         let mut best_move = 0;
 
         for m in moves.iter() {
+            let quiet_move = !is_tactical_move(position, m);
             let undo = position.make_move_unchecked(m);
-            self.history.push(position.history_hash());
-            let value = self.negamax(position, depth - 1, -beta, -alpha, stats, deadline);
-            self.history.pop();
+            self.repetition_history.push(position.history_hash());
+            let value = self.negamax(
+                position,
+                depth - 1,
+                SearchWindow {
+                    alpha: -beta,
+                    beta: -alpha,
+                },
+                stats,
+                deadline,
+                ply + 1,
+            );
+            self.repetition_history.pop();
             position.undo_move_unchecked(m, undo);
             let value = -value?;
 
@@ -1594,6 +1715,9 @@ impl Searcher {
                 alpha = value;
             }
             if alpha >= beta {
+                if quiet_move {
+                    self.note_quiet_cutoff(ply, m, depth);
+                }
                 break;
             }
         }
@@ -1609,6 +1733,72 @@ impl Searcher {
         self.tt
             .store(position.tt_key(), depth, best_value, bound, best_move);
         Ok(best_value)
+    }
+
+    fn quiescence(
+        &mut self,
+        position: &mut Position,
+        window: SearchWindow,
+        stats: &mut SearchStats,
+        deadline: Option<SearchDeadline>,
+        ply: usize,
+    ) -> Result<i32, SearchAborted> {
+        let mut alpha = window.alpha;
+        let beta = window.beta;
+        stats.nodes += 1;
+        if search_timed_out(deadline, stats.nodes) {
+            return Err(SearchAborted::Timeout);
+        }
+        if is_draw_by_rule(position, &self.repetition_history) {
+            return Ok(0);
+        }
+
+        let in_check = position.in_check(position.side_to_move);
+        if !in_check {
+            let stand_pat = position.evaluate();
+            if stand_pat >= beta {
+                return Ok(beta);
+            }
+            alpha = alpha.max(stand_pat);
+        }
+
+        let mut moves = if in_check {
+            generate_legal_moves(position)
+        } else {
+            generate_legal_tactical_moves(position)
+        };
+        if moves.num_moves == 0 {
+            return Ok(if in_check { -CHECKMATE_SCORE } else { alpha });
+        }
+
+        self.order_moves(position, &mut moves, None, ply);
+
+        for m in moves.iter() {
+            let undo = position.make_move_unchecked(m);
+            self.repetition_history.push(position.history_hash());
+            let value = self.quiescence(
+                position,
+                SearchWindow {
+                    alpha: -beta,
+                    beta: -alpha,
+                },
+                stats,
+                deadline,
+                ply + 1,
+            );
+            self.repetition_history.pop();
+            position.undo_move_unchecked(m, undo);
+            let value = -value?;
+
+            if value >= beta {
+                return Ok(beta);
+            }
+            if value > alpha {
+                alpha = value;
+            }
+        }
+
+        Ok(alpha)
     }
 }
 
@@ -2193,50 +2383,32 @@ fn generate_legal_moves(position: &mut Position) -> Moves {
     legal_moves
 }
 
-fn move_score(position: &Position, m: Move, tt_move: Option<Move>) -> i32 {
-    if tt_move.is_some_and(|candidate| candidate == m) {
-        return i32::MAX;
-    }
-
-    let origin = origin_square(m);
-    let moving_piece = position.by_piece[origin as usize];
-    let captured_piece = if move_flag(m) == MoveFlag::EnPassant {
-        Piece::from_kind_color(PieceKind::Pawn, position.side_to_move.opposite())
-    } else {
-        position.by_piece[destination_square(m) as usize]
-    };
-
-    let mut score = 0;
-    if captured_piece != Piece::Empty {
-        score += 10_000;
-        score += piece_value(captured_piece.kind()) * 16 - piece_value(moving_piece.kind());
-    }
-    if let Some(kind) = promotion_kind(m) {
-        score += 8_000 + piece_value(kind);
-    }
-    score
+fn is_tactical_move(position: &Position, m: Move) -> bool {
+    promotion_kind(m).is_some()
+        || move_flag(m) == MoveFlag::EnPassant
+        || position.by_piece[destination_square(m) as usize] != Piece::Empty
 }
 
-fn order_moves(position: &Position, moves: &mut Moves, tt_move: Option<Move>) {
-    let mut scores = [0; 256];
-    for (idx, score) in scores.iter_mut().enumerate().take(moves.num_moves) {
-        *score = move_score(position, moves.moves[idx], tt_move);
-    }
+fn generate_legal_tactical_moves(position: &mut Position) -> Moves {
+    let pseudo_legal_moves = generate_pseudo_legal_moves(position);
+    let mut legal_moves = Moves::new();
+    let side_to_move = position.side_to_move;
 
-    for i in 1..moves.num_moves {
-        let move_to_insert = moves.moves[i];
-        let score_to_insert = scores[i];
-        let mut j = i;
-
-        while j > 0 && score_to_insert > scores[j - 1] {
-            moves.moves[j] = moves.moves[j - 1];
-            scores[j] = scores[j - 1];
-            j -= 1;
+    for m in pseudo_legal_moves.iter() {
+        if !is_tactical_move(position, m) {
+            continue;
         }
 
-        moves.moves[j] = move_to_insert;
-        scores[j] = score_to_insert;
+        let undo = position.make_move_unchecked(m);
+        let is_legal = !position.in_check(side_to_move);
+        position.undo_move_unchecked(m, undo);
+
+        if is_legal {
+            legal_moves.push(m);
+        }
     }
+
+    legal_moves
 }
 
 #[cfg(test)]
@@ -2484,6 +2656,19 @@ mod tests {
         assert!(searcher
             .best_move_with_time_budget(&position, &position_history, Duration::from_millis(1),)
             .is_none());
+    }
+
+    #[test]
+    fn quiescence_avoids_a_poisoned_rook_capture() {
+        let mut searcher = Searcher::new();
+        let mut position = position_from_fen("6k1/8/3b4/4r3/8/8/4Q3/6K1 w - - 0 1");
+
+        let (best_move, _) = searcher
+            .search_root(&mut position, 1, None)
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(move_to_uci(best_move), "e2e5");
     }
 
     #[test]
