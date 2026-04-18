@@ -100,6 +100,7 @@ const DOUBLE_PUSH_MASK: [Bitboard; 2] = [RANK_MASKS[2], RANK_MASKS[5]];
 const TT_BITS: usize = 18;
 const TT_SIZE: usize = 1 << TT_BITS;
 const TIME_CHECK_INTERVAL: u64 = 1 << 10;
+const MAX_GAME_PHASE: i32 = 24;
 const ZOBRIST_SEED_INC: u64 = 0x9E37_79B9_7F4A_7C15;
 const WHITE_KINGSIDE_CASTLE: u8 = 1 << 0;
 const WHITE_QUEENSIDE_CASTLE: u8 = 1 << 1;
@@ -113,6 +114,10 @@ const WHITE_QUEENSIDE_ROOK_START: Square = 0;
 const BLACK_KING_START: Square = 60;
 const BLACK_KINGSIDE_ROOK_START: Square = 63;
 const BLACK_QUEENSIDE_ROOK_START: Square = 56;
+const KNIGHT_MOBILITY_BONUS: i32 = 4;
+const BISHOP_MOBILITY_BONUS: i32 = 4;
+const ROOK_MOBILITY_BONUS: i32 = 2;
+const QUEEN_MOBILITY_BONUS: i32 = 1;
 
 #[cfg(not(target_arch = "wasm32"))]
 type SearchDeadline = Instant;
@@ -272,6 +277,14 @@ pub struct Position {
 pub struct SearchStats {
     pub nodes: u64,
     pub score: i32,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum GameResult {
+    Ongoing,
+    Draw,
+    WhiteWin,
+    BlackWin,
 }
 
 #[derive(Copy, Clone)]
@@ -444,8 +457,56 @@ fn piece_value(kind: PieceKind) -> i32 {
     }
 }
 
+const PAWN_PST: [i32; 64] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, -20, -20, 10, 10, 5, 5, -5, -10, 0, 0, -10, -5, 5, 0, 0, 0,
+    20, 20, 0, 0, 0, 5, 5, 10, 25, 25, 10, 5, 5, 10, 10, 20, 30, 30, 20, 10, 10, 50, 50, 50, 50,
+    50, 50, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+const KNIGHT_PST: [i32; 64] = [
+    -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10,
+    0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10,
+    5, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50,
+];
+
+const BISHOP_PST: [i32; 64] = [
+    -20, -10, -10, -10, -10, -10, -10, -20, -10, 5, 0, 0, 0, 0, 5, -10, -10, 10, 10, 10, 10, 10,
+    10, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 5, 10, 10, 5, 0,
+    -10, -10, 0, 0, 0, 0, 0, 0, -10, -20, -10, -10, -10, -10, -10, -10, -20,
+];
+
+const ROOK_PST: [i32; 64] = [
+    0, 0, 5, 10, 10, 5, 0, 0, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0,
+    0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 5, 10, 10, 10, 10, 10, 10, 5, 0,
+    0, 0, 0, 0, 0, 0, 0,
+];
+
+const QUEEN_PST: [i32; 64] = [
+    -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10,
+    -5, 0, 5, 5, 5, 5, 0, -5, -5, 0, 5, 5, 5, 5, 0, -5, -10, 0, 5, 5, 5, 5, 0, -10, -10, 0, 0, 0,
+    0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20,
+];
+
+const KING_MIDDLEGAME_PST: [i32; 64] = [
+    20, 30, 10, 0, 0, 10, 30, 20, 20, 20, 0, 0, 0, 0, 20, 20, -10, -20, -20, -20, -20, -20, -20,
+    -10, -20, -30, -30, -40, -40, -30, -30, -20, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40,
+    -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50,
+    -40, -40, -30,
+];
+
+const KING_ENDGAME_PST: [i32; 64] = [
+    -50, -40, -30, -20, -20, -30, -40, -50, -30, -20, -10, 0, 0, -10, -20, -30, -30, -10, 20, 30,
+    30, 20, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30,
+    -10, 20, 30, 30, 20, -10, -30, -30, -30, 0, 0, 0, 0, -30, -30, -50, -30, -30, -30, -30, -30,
+    -30, -50,
+];
+
 fn destination_square(m: Move) -> Square {
     m & 0x3F
+}
+
+fn mirror_square(square: Square) -> Square {
+    square ^ 56
 }
 
 fn origin_square(m: Move) -> Square {
@@ -1030,22 +1091,144 @@ impl Position {
 
     fn material(&self, color: Color) -> i32 {
         let color_mask = self.colors[color as usize];
+        [
+            PieceKind::Pawn,
+            PieceKind::Knight,
+            PieceKind::Bishop,
+            PieceKind::Rook,
+            PieceKind::Queen,
+            PieceKind::King,
+        ]
+        .into_iter()
+        .map(|kind| {
+            (self.positions[kind as usize] & color_mask).count_ones() as i32 * piece_value(kind)
+        })
+        .sum()
+    }
 
-        let mut value = 0;
-        value += (self.positions[PieceKind::Pawn as usize] & color_mask).count_ones() as i32 * 100;
-        value +=
-            (self.positions[PieceKind::Knight as usize] & color_mask).count_ones() as i32 * 320;
-        value +=
-            (self.positions[PieceKind::Bishop as usize] & color_mask).count_ones() as i32 * 330;
-        value += (self.positions[PieceKind::Rook as usize] & color_mask).count_ones() as i32 * 500;
-        value += (self.positions[PieceKind::Queen as usize] & color_mask).count_ones() as i32 * 900;
-        value +=
-            (self.positions[PieceKind::King as usize] & color_mask).count_ones() as i32 * 20000;
-        value
+    fn game_phase(&self) -> i32 {
+        let mut phase = 0;
+        for color in [Color::White, Color::Black] {
+            phase += self.pieces(color, PieceKind::Knight).count_ones() as i32;
+            phase += self.pieces(color, PieceKind::Bishop).count_ones() as i32;
+            phase += self.pieces(color, PieceKind::Rook).count_ones() as i32 * 2;
+            phase += self.pieces(color, PieceKind::Queen).count_ones() as i32 * 4;
+        }
+        phase.min(MAX_GAME_PHASE)
+    }
+
+    fn piece_square_index(color: Color, square: Square) -> usize {
+        match color {
+            Color::White => square as usize,
+            Color::Black => mirror_square(square) as usize,
+        }
+    }
+
+    fn pst_sum(&self, color: Color, kind: PieceKind, table: &[i32; 64]) -> i32 {
+        let mut pieces = self.pieces(color, kind);
+        let mut score = 0;
+
+        while pieces != 0 {
+            let square = pop_square(&mut pieces);
+            score += table[Self::piece_square_index(color, square)];
+        }
+
+        score
+    }
+
+    fn piece_square_score(&self, color: Color, phase: i32) -> i32 {
+        let mut score = 0;
+        score += self.pst_sum(color, PieceKind::Pawn, &PAWN_PST);
+        score += self.pst_sum(color, PieceKind::Knight, &KNIGHT_PST);
+        score += self.pst_sum(color, PieceKind::Bishop, &BISHOP_PST);
+        score += self.pst_sum(color, PieceKind::Rook, &ROOK_PST);
+        score += self.pst_sum(color, PieceKind::Queen, &QUEEN_PST);
+
+        if let Some(square) = self.king_square(color) {
+            let index = Self::piece_square_index(color, square);
+            let middlegame = KING_MIDDLEGAME_PST[index];
+            let endgame = KING_ENDGAME_PST[index];
+            score += (middlegame * phase + endgame * (MAX_GAME_PHASE - phase)) / MAX_GAME_PHASE;
+        }
+
+        score
+    }
+
+    fn development_score(&self, color: Color, phase: i32) -> i32 {
+        if phase == 0 {
+            return 0;
+        }
+
+        let (knight_home, bishop_home, king_start, castled_squares, castling_rights) = match color {
+            Color::White => (
+                to_bb(1) | to_bb(6),
+                to_bb(2) | to_bb(5),
+                WHITE_KING_START,
+                [6, 2],
+                WHITE_KINGSIDE_CASTLE | WHITE_QUEENSIDE_CASTLE,
+            ),
+            Color::Black => (
+                to_bb(57) | to_bb(62),
+                to_bb(58) | to_bb(61),
+                BLACK_KING_START,
+                [62, 58],
+                BLACK_KINGSIDE_CASTLE | BLACK_QUEENSIDE_CASTLE,
+            ),
+        };
+
+        let developed_knights = (self.pieces(color, PieceKind::Knight) & !knight_home)
+            .count_ones()
+            .min(2) as i32;
+        let developed_bishops = (self.pieces(color, PieceKind::Bishop) & !bishop_home)
+            .count_ones()
+            .min(2) as i32;
+
+        let mut score = developed_knights * 14 + developed_bishops * 12;
+        let king_square = self.king_square(color);
+
+        if king_square.is_some_and(|square| castled_squares.contains(&square)) {
+            score += 30;
+        }
+        if king_square == Some(king_start) && self.castling_rights & castling_rights == 0 {
+            score -= 20;
+        }
+
+        score * phase / MAX_GAME_PHASE
+    }
+
+    fn mobility_score_for_kind(&self, color: Color, kind: PieceKind, bonus: i32) -> i32 {
+        let own_pieces = self.colors[color as usize];
+        let enemy_king = self.pieces(color.opposite(), PieceKind::King);
+        let mut pieces = self.pieces(color, kind);
+        let mut score = 0;
+
+        while pieces != 0 {
+            let from = pop_square(&mut pieces);
+            let targets = get_attacks(from, self, kind) & !own_pieces & !enemy_king;
+            score += targets.count_ones() as i32 * bonus;
+        }
+
+        score
+    }
+
+    fn mobility_score(&self, color: Color) -> i32 {
+        self.mobility_score_for_kind(color, PieceKind::Knight, KNIGHT_MOBILITY_BONUS)
+            + self.mobility_score_for_kind(color, PieceKind::Bishop, BISHOP_MOBILITY_BONUS)
+            + self.mobility_score_for_kind(color, PieceKind::Rook, ROOK_MOBILITY_BONUS)
+            + self.mobility_score_for_kind(color, PieceKind::Queen, QUEEN_MOBILITY_BONUS)
+    }
+
+    fn evaluate_color(&self, color: Color, phase: i32) -> i32 {
+        self.material(color)
+            + self.piece_square_score(color, phase)
+            + self.development_score(color, phase)
+            + self.mobility_score(color)
     }
 
     fn evaluate(&self) -> i32 {
-        self.material(self.side_to_move) - self.material(self.side_to_move.opposite())
+        let phase = self.game_phase();
+        self.evaluate_color(self.side_to_move, phase)
+            - self.evaluate_color(self.side_to_move.opposite(), phase)
     }
 
     fn is_consistent(&self) -> bool {
@@ -1439,6 +1622,46 @@ pub fn create_move(origin: Square, destination: Square) -> Move {
     create_flagged_move(origin, destination, MoveFlag::Quiet)
 }
 
+pub fn move_to_uci(m: Move) -> String {
+    let mut uci = String::with_capacity(5);
+    append_square_name(&mut uci, origin_square(m));
+    append_square_name(&mut uci, destination_square(m));
+    if let Some(kind) = promotion_kind(m) {
+        uci.push(match kind {
+            PieceKind::Knight => 'n',
+            PieceKind::Bishop => 'b',
+            PieceKind::Rook => 'r',
+            PieceKind::Queen => 'q',
+            PieceKind::Empty | PieceKind::Pawn | PieceKind::King => unreachable!(),
+        });
+    }
+    uci
+}
+
+pub fn move_from_uci(position: &Position, uci: &str) -> Option<Move> {
+    if !(uci.len() == 4 || uci.len() == 5) {
+        return None;
+    }
+
+    let origin = parse_square_name(&uci[..2]).ok()?;
+    let destination = parse_square_name(&uci[2..4]).ok()?;
+    let promotion = match uci.as_bytes().get(4).copied() {
+        Some(b'n') => Some(PieceKind::Knight),
+        Some(b'b') => Some(PieceKind::Bishop),
+        Some(b'r') => Some(PieceKind::Rook),
+        Some(b'q') => Some(PieceKind::Queen),
+        Some(_) => return None,
+        None => None,
+    };
+
+    let mut scratch = *position;
+    generate_legal_moves(&mut scratch).iter().find(|m| {
+        origin_square(*m) == origin
+            && destination_square(*m) == destination
+            && promotion_kind(*m) == promotion
+    })
+}
+
 pub fn is_selectable_piece(position: &Position, square: Square) -> bool {
     let piece = position.piece_at(square);
     piece != Piece::Empty && piece.color() == position.side_to_move()
@@ -1472,6 +1695,26 @@ pub fn try_player_move(position: &mut Position, origin: Square, destination: Squ
         true
     } else {
         false
+    }
+}
+
+pub fn game_result(position: &Position, position_history: &[u64]) -> GameResult {
+    if is_draw_by_rule(position, position_history) {
+        return GameResult::Draw;
+    }
+
+    let mut scratch = *position;
+    if generate_legal_moves(&mut scratch).num_moves != 0 {
+        return GameResult::Ongoing;
+    }
+
+    if position.in_check(position.side_to_move) {
+        match position.side_to_move {
+            Color::White => GameResult::BlackWin,
+            Color::Black => GameResult::WhiteWin,
+        }
+    } else {
+        GameResult::Draw
     }
 }
 
@@ -1567,6 +1810,11 @@ fn parse_square_name(square: &str) -> Result<Square, String> {
     };
 
     Ok((rank as u32) * 8 + file as u32)
+}
+
+fn append_square_name(buffer: &mut String, square: Square) {
+    buffer.push((b'a' + (square % 8) as u8) as char);
+    buffer.push((b'1' + (square / 8) as u8) as char);
 }
 
 pub fn search_best_move(
@@ -2050,8 +2298,60 @@ mod tests {
             Color::Black,
         );
 
-        assert_eq!(white_to_move.evaluate(), 900);
-        assert_eq!(black_to_move.evaluate(), -900);
+        assert!(white_to_move.evaluate() > 0);
+        assert_eq!(white_to_move.evaluate(), -black_to_move.evaluate());
+    }
+
+    #[test]
+    fn developed_knight_scores_higher_than_home_knight() {
+        let home_knight = board_with(
+            &[
+                (4, Piece::WhiteKing),
+                (60, Piece::BlackKing),
+                (6, Piece::WhiteKnight),
+            ],
+            Color::White,
+        );
+        let developed_knight = board_with(
+            &[
+                (4, Piece::WhiteKing),
+                (60, Piece::BlackKing),
+                (21, Piece::WhiteKnight),
+            ],
+            Color::White,
+        );
+
+        assert!(developed_knight.evaluate() > home_knight.evaluate());
+    }
+
+    #[test]
+    fn castled_king_scores_higher_than_uncastled_king() {
+        let uncastled = position_from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1");
+        let castled = position_from_fen("4k3/8/8/8/8/8/8/R4RK1 w - - 0 1");
+
+        assert!(castled.evaluate() > uncastled.evaluate());
+    }
+
+    #[test]
+    fn active_rook_scores_higher_than_corner_rook() {
+        let corner_rook = board_with(
+            &[
+                (7, Piece::WhiteKing),
+                (63, Piece::BlackKing),
+                (0, Piece::WhiteRook),
+            ],
+            Color::White,
+        );
+        let active_rook = board_with(
+            &[
+                (7, Piece::WhiteKing),
+                (63, Piece::BlackKing),
+                (27, Piece::WhiteRook),
+            ],
+            Color::White,
+        );
+
+        assert!(active_rook.evaluate() > corner_rook.evaluate());
     }
 
     #[test]
@@ -2184,5 +2484,21 @@ mod tests {
         assert!(searcher
             .best_move_with_time_budget(&position, &position_history, Duration::from_millis(1),)
             .is_none());
+    }
+
+    #[test]
+    fn uci_move_round_trips_a_quiet_move() {
+        let position = Position::new();
+        let m = move_from_uci(&position, "e2e4").expect("uci move should parse");
+
+        assert_eq!(move_to_uci(m), "e2e4");
+    }
+
+    #[test]
+    fn uci_move_round_trips_a_promotion() {
+        let position = position_from_fen("7k/P7/8/8/8/8/8/4K3 w - - 0 1");
+        let m = move_from_uci(&position, "a7a8q").expect("promotion should parse");
+
+        assert_eq!(move_to_uci(m), "a7a8q");
     }
 }
