@@ -1,6 +1,6 @@
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    panic!("capture_lab is native-only");
+    panic!("design_lab is native-only");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,6 +9,7 @@ mod native {
     use onion::engine::{Piece, Square};
     use std::{
         borrow::Cow,
+        env,
         fs,
         path::{Path, PathBuf},
         time::{Duration, Instant, SystemTime},
@@ -67,8 +68,14 @@ mod native {
         extras: Vec<PiecePlacement>,
     }
 
+    #[derive(Debug, Copy, Clone)]
+    struct SinglePieceMode {
+        piece: Piece,
+        square: Square,
+    }
+
     fn scenarios_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture_lab_moves.txt")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("design_lab_scenes.txt")
     }
 
     fn parse_square_name(name: &str) -> Result<Square, String> {
@@ -103,6 +110,59 @@ mod native {
         }
     }
 
+    fn parse_piece_option(name: &str) -> Result<Piece, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pawn" | "white-pawn" | "white_pawn" => Ok(Piece::WhitePawn),
+            "black-pawn" | "black_pawn" => Ok(Piece::BlackPawn),
+            "knight" | "white-knight" | "white_knight" | "horse" => Ok(Piece::WhiteKnight),
+            "black-knight" | "black_knight" | "black-horse" | "black_horse" => {
+                Ok(Piece::BlackKnight)
+            }
+            "bishop" | "white-bishop" | "white_bishop" => Ok(Piece::WhiteBishop),
+            "black-bishop" | "black_bishop" => Ok(Piece::BlackBishop),
+            "rook" | "white-rook" | "white_rook" => Ok(Piece::WhiteRook),
+            "black-rook" | "black_rook" => Ok(Piece::BlackRook),
+            "queen" | "white-queen" | "white_queen" => Ok(Piece::WhiteQueen),
+            "black-queen" | "black_queen" => Ok(Piece::BlackQueen),
+            "king" | "white-king" | "white_king" => Ok(Piece::WhiteKing),
+            "black-king" | "black_king" => Ok(Piece::BlackKing),
+            other => parse_piece_name(other),
+        }
+    }
+
+    fn parse_cli_args() -> Result<Option<SinglePieceMode>, String> {
+        let mut args = env::args().skip(1);
+        let mut piece = None;
+        let mut square = None;
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--piece" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--piece requires a value".to_string())?;
+                    piece = Some(parse_piece_option(&value)?);
+                }
+                "--square" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--square requires a value".to_string())?;
+                    square = Some(parse_square_name(&value)?);
+                }
+                other => {
+                    return Err(format!(
+                        "unknown argument '{other}', expected '--piece <piece>' or '--square <square>'"
+                    ));
+                }
+            }
+        }
+
+        Ok(piece.map(|piece| SinglePieceMode {
+            piece,
+            square: square.unwrap_or(28),
+        }))
+    }
+
     fn parse_extra_placements(spec: &str) -> Result<Vec<PiecePlacement>, String> {
         let trimmed = spec.trim();
         if trimmed.is_empty() || trimmed == "-" {
@@ -124,8 +184,8 @@ mod native {
     }
 
     fn load_scenarios(path: &Path) -> Result<(Vec<LabScenario>, SystemTime), String> {
-        let source = fs::read_to_string(path)
-            .map_err(|error| format!("failed to read scenarios: {error}"))?;
+        let source =
+            fs::read_to_string(path).map_err(|error| format!("failed to read scenarios: {error}"))?;
         let metadata =
             fs::metadata(path).map_err(|error| format!("failed to stat scenarios: {error}"))?;
         let modified = metadata
@@ -211,8 +271,42 @@ mod native {
             board
         }
 
+        fn from_single_piece(
+            piece: Piece,
+            square: Square,
+            animation_time_seconds: f32,
+        ) -> GpuState {
+            let mut board = GpuState {
+                pieces: [0; 64],
+                markers: [0; 64],
+                status: [0.0, animation_time_seconds, 0.0, 0.0],
+                moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
+                moving_piece: [0; 4],
+            };
+            board.pieces[square as usize] = piece as i32;
+            board
+        }
+
         fn as_byte_slice(&self) -> &[u8] {
             bytemuck::bytes_of(self)
+        }
+    }
+
+    fn piece_display_name(piece: Piece) -> &'static str {
+        match piece {
+            Piece::Empty => "Empty",
+            Piece::WhitePawn => "White Pawn",
+            Piece::BlackPawn => "Black Pawn",
+            Piece::WhiteKnight => "White Knight",
+            Piece::BlackKnight => "Black Knight",
+            Piece::WhiteBishop => "White Bishop",
+            Piece::BlackBishop => "Black Bishop",
+            Piece::WhiteRook => "White Rook",
+            Piece::BlackRook => "Black Rook",
+            Piece::WhiteQueen => "White Queen",
+            Piece::BlackQueen => "Black Queen",
+            Piece::WhiteKing => "White King",
+            Piece::BlackKing => "Black King",
         }
     }
 
@@ -279,10 +373,7 @@ mod native {
         let to = square_center(scenario.to);
         let dx = to[0] - from[0];
         let dy = to[1] - from[1];
-        let is_knight = matches!(
-            scenario.moving_piece,
-            Piece::WhiteKnight | Piece::BlackKnight
-        );
+        let is_knight = matches!(scenario.moving_piece, Piece::WhiteKnight | Piece::BlackKnight);
         if is_knight {
             let (corner, first_leg_fraction) = if dx.abs() > dy.abs() {
                 ([to[0], from[1]], 2.0 / 3.0)
@@ -347,7 +438,11 @@ mod native {
             let contact_path_progress = capture_contact_path_progress(scenario);
             let contact_time_fraction =
                 CAPTURE_CONTACT_TIME_SECONDS / MOVE_ANIMATION_DURATION_SECONDS;
-            smooth_capture_path_progress(raw_progress, contact_time_fraction, contact_path_progress)
+            smooth_capture_path_progress(
+                raw_progress,
+                contact_time_fraction,
+                contact_path_progress,
+            )
         } else {
             let t = raw_progress.clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
@@ -364,14 +459,17 @@ mod native {
 
     fn scenario_gpu_state(scenario: LabScenario, elapsed_seconds: f32) -> GpuState {
         let moving_piece = scenario_moving_piece(&scenario, elapsed_seconds);
-        if elapsed_seconds >= SCENARIO_LEAD_IN_SECONDS + MOVE_ANIMATION_DURATION_SECONDS {
+        let board = if elapsed_seconds
+            >= SCENARIO_LEAD_IN_SECONDS + MOVE_ANIMATION_DURATION_SECONDS
+        {
             let mut board = GpuState::from_scenario(&scenario, None, elapsed_seconds);
             board.pieces[scenario.from as usize] = Piece::Empty as i32;
             board.pieces[scenario.to as usize] = scenario.moving_piece as i32;
             board
         } else {
             GpuState::from_scenario(&scenario, moving_piece, elapsed_seconds)
-        }
+        };
+        board
     }
 
     struct HotReloadPipeline {
@@ -406,11 +504,11 @@ mod native {
 
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("capture_lab_shader"),
+            label: Some("design_lab_shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("capture_lab_pipeline"),
+            label: Some("design_lab_pipeline"),
             layout: Some(pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -520,7 +618,7 @@ mod native {
         (config, format)
     }
 
-    async fn run(event_loop: EventLoop<()>, window: Window) {
+    async fn run(event_loop: EventLoop<()>, window: Window, single_piece_mode: Option<SinglePieceMode>) {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = unsafe { instance.create_surface(&window) }.unwrap();
@@ -549,24 +647,32 @@ mod native {
         let (mut config, surface_format) =
             configure_surface(&surface, &device, &adapter, size.width, size.height);
 
-        let scenarios_path = scenarios_path();
-        let (scenarios, scenarios_mtime) =
-            load_scenarios(&scenarios_path).expect("failed to load initial scenarios");
-        let mut hot_scenarios = HotReloadScenarios {
-            scenarios,
-            scenarios_mtime,
-            last_poll: Instant::now(),
-        };
+        let mut hot_scenarios = single_piece_mode.is_none().then(|| {
+            let scenarios_path = scenarios_path();
+            let (scenarios, scenarios_mtime) =
+                load_scenarios(&scenarios_path).expect("failed to load initial scenarios");
+            HotReloadScenarios {
+                scenarios,
+                scenarios_mtime,
+                last_poll: Instant::now(),
+            }
+        });
 
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("capture_lab_uniforms"),
-            contents: GpuState::from_scenario(&hot_scenarios.scenarios[0], None, 0.0)
-                .as_byte_slice(),
+            label: Some("design_lab_uniforms"),
+            contents: match single_piece_mode {
+                Some(mode) => GpuState::from_single_piece(mode.piece, mode.square, 0.0),
+                None => {
+                    let scenarios = &hot_scenarios.as_ref().unwrap().scenarios;
+                    GpuState::from_scenario(&scenarios[0], None, 0.0)
+                }
+            }
+            .as_byte_slice(),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("capture_lab_bind_group_layout"),
+            label: Some("design_lab_bind_group_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -580,7 +686,7 @@ mod native {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("capture_lab_bind_group"),
+            label: Some("design_lab_bind_group"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -589,7 +695,7 @@ mod native {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("capture_lab_pipeline_layout"),
+            label: Some("design_lab_pipeline_layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
@@ -604,6 +710,7 @@ mod native {
             last_poll: Instant::now(),
         };
 
+        let scenarios_path = scenarios_path();
         let start_time = Instant::now();
         let mut current_scenario_index = usize::MAX;
         window.request_redraw();
@@ -620,25 +727,37 @@ mod native {
                         surface_format,
                         &path,
                     );
-                    maybe_reload_scenarios(&mut hot_scenarios, &scenarios_path);
 
                     let elapsed_seconds = start_time.elapsed().as_secs_f32();
-                    let scenario_index = ((elapsed_seconds / SCENARIO_DURATION_SECONDS) as usize)
-                        % hot_scenarios.scenarios.len();
-                    if scenario_index != current_scenario_index {
-                        current_scenario_index = scenario_index;
-                        window.set_title(&format!(
-                            "Onion Capture Lab - {}",
-                            hot_scenarios.scenarios[scenario_index].name
-                        ));
-                    }
+                    if let Some(single_piece_mode) = single_piece_mode {
+                        let gpu_state = GpuState::from_single_piece(
+                            single_piece_mode.piece,
+                            single_piece_mode.square,
+                            elapsed_seconds,
+                        );
+                        queue.write_buffer(&uniform_buf, 0, gpu_state.as_byte_slice());
+                    } else {
+                        let hot_scenarios = hot_scenarios.as_mut().unwrap();
+                        maybe_reload_scenarios(hot_scenarios, &scenarios_path);
 
-                    let scenario_elapsed = elapsed_seconds % SCENARIO_DURATION_SECONDS;
-                    let gpu_state = scenario_gpu_state(
-                        hot_scenarios.scenarios[scenario_index].clone(),
-                        scenario_elapsed,
-                    );
-                    queue.write_buffer(&uniform_buf, 0, gpu_state.as_byte_slice());
+                        let scenario_index =
+                            ((elapsed_seconds / SCENARIO_DURATION_SECONDS) as usize)
+                                % hot_scenarios.scenarios.len();
+                        if scenario_index != current_scenario_index {
+                            current_scenario_index = scenario_index;
+                            window.set_title(&format!(
+                                "Onion Design Lab - {}",
+                                hot_scenarios.scenarios[scenario_index].name
+                            ));
+                        }
+
+                        let scenario_elapsed = elapsed_seconds % SCENARIO_DURATION_SECONDS;
+                        let gpu_state = scenario_gpu_state(
+                            hot_scenarios.scenarios[scenario_index].clone(),
+                            scenario_elapsed,
+                        );
+                        queue.write_buffer(&uniform_buf, 0, gpu_state.as_byte_slice());
+                    }
                     window.request_redraw();
                 }
                 Event::RedrawRequested(_) => {
@@ -661,12 +780,12 @@ mod native {
                         .create_view(&wgpu::TextureViewDescriptor::default());
                     let mut encoder =
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("capture_lab_encoder"),
+                            label: Some("design_lab_encoder"),
                         });
 
                     {
                         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("capture_lab_pass"),
+                            label: Some("design_lab_pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: &view,
                                 resolve_target: None,
@@ -707,13 +826,19 @@ mod native {
 
     pub fn main() {
         env_logger::init();
+        let single_piece_mode =
+            parse_cli_args().unwrap_or_else(|error| panic!("invalid design_lab args: {error}"));
         let event_loop = EventLoop::new();
+        let title = match single_piece_mode {
+            Some(mode) => format!("Onion Design Lab - {}", piece_display_name(mode.piece)),
+            None => "Onion Design Lab".to_string(),
+        };
         let window = winit::window::WindowBuilder::new()
-            .with_title("Onion Capture Lab")
+            .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 800.0))
             .build(&event_loop)
             .unwrap();
-        pollster::block_on(run(event_loop, window));
+        pollster::block_on(run(event_loop, window, single_piece_mode));
     }
 }
 

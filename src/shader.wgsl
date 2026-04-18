@@ -2,6 +2,12 @@ alias v2 = vec2<f32>;
 alias v3 = vec3<f32>;
 alias v4 = vec4<f32>; 
 
+fn rotate(p: v2, angle: f32) -> v2 {
+    let c = cos(angle);
+    let s = sin(angle);
+    return mat2x2<f32>(c, -s, s, c) * p;
+}
+
 struct uniforms {
     pieces: array<vec4<i32>, 16>,
     markers: array<vec4<i32>, 16>,
@@ -58,6 +64,13 @@ fn dot2(p : v2) -> f32
 fn sd_circle(p : v2, r : f32) -> f32
 {
     return length(p) - r;
+}
+
+fn sd_ellipse(p : v2, r : v2) -> f32
+{
+    let k0 = length(p / r);
+    let k1 = length(p / (r * r));
+    return k0 * (k0 - 1.0) / k1;
 }
 
 fn ease(x : f32) -> f32
@@ -150,6 +163,27 @@ fn sd_polygon(p : v2, v : ptr<function, array<v2, 9>>) -> f32
     return s*sqrt(d);
 } 
 
+fn sd_triangle(p : v2, a : v2, b : v2, c : v2) -> f32
+{
+    let e0 = b - a;
+    let e1 = c - b;
+    let e2 = a - c;
+    let w0 = p - a;
+    let w1 = p - b;
+    let w2 = p - c;
+
+    let pq0 = w0 - e0 * clamp(dot(w0, e0) / dot(e0, e0), 0.0, 1.0);
+    let pq1 = w1 - e1 * clamp(dot(w1, e1) / dot(e1, e1), 0.0, 1.0);
+    let pq2 = w2 - e2 * clamp(dot(w2, e2) / dot(e2, e2), 0.0, 1.0);
+
+    let s = sign(e0.x * e2.y - e0.y * e2.x);
+    let d0 = v2(dot(pq0, pq0), s * (w0.x * e0.y - w0.y * e0.x));
+    let d1 = v2(dot(pq1, pq1), s * (w1.x * e1.y - w1.y * e1.x));
+    let d2 = v2(dot(pq2, pq2), s * (w2.x * e2.y - w2.y * e2.x));
+    let d = min(min(d0, d1), d2);
+    return -sqrt(d.x) * sign(d.y);
+}
+
 fn sd_heart(p1 : v2) -> f32
 {
     var p = p1;
@@ -196,6 +230,14 @@ fn pawn(p : v2) -> f32
     let tie = min(min(tie1, tie2), tie3);
     let a = op_subtraction(p.y + 0.825, min(base, top));
     return min(a, tie);
+}
+
+fn knight(p : v2) -> f32 {
+    let bottom = sd_rounded_box(p + v2(0., 0.72), v2(0.58, 0.14), v4(0.14,0.,0.14,0.));
+    let head = sd_oriented_box(p, v2(-0.5, -0.1), v2(-0.1, 0.4), 0.1) - 0.1;
+    let head_disk = sd_ellipse(rotate(p - v2(0.1, -0.2), -0.2), v2(0.3, 0.6));
+    let ear = sd_triangle(p, v2(-0.2, 0.45), v2(-0.1, 0.45), v2(-0.15, 0.6)) - 0.05;
+    return op_union(op_union(op_union(bottom, head), head_disk), ear);
 }
 
 fn bishop(p : v2) -> f32 {
@@ -318,7 +360,7 @@ fn dispatch_piece_code(p : v2, piece : i32) -> f32 {
     let piece_kind = (piece - 1) / 2;
     switch piece_kind {
         case 0: { return pawn(p); }
-        case 1: { return sd_circle(p, 0.8); }
+        case 1: { return knight(p); }
         case 2: { return bishop(p); }
         case 3: { return rook(p); }
         case 4: { return queen(p); }
@@ -417,15 +459,15 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
         col = square;
     }
 
-    if marker == 1 {
-        let disk_alpha = select(0.9, 0.85, piece != 0);
-        col = mix(col, move_disk, disk_strength * disk_alpha);
-    }
-
     let outline_width = 3.0 * max(fwidth(d_composed), 0.002);
     let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_composed));
     let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
     col = mix(col, outline_color, outline);
+
+    if marker == 1 {
+        let disk_alpha = select(0.9, 0.85, piece != 0);
+        col = mix(col, move_disk, disk_strength * disk_alpha);
+    }
 
     if marker == 1 {
         col = mix(col, move_disk, disk_strength * 0.25);
