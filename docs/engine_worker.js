@@ -5,13 +5,17 @@
  * @param {number} side_to_move
  * @param {number} castling_rights
  * @param {number} en_passant_square
+ * @param {number} halfmove_clock
+ * @param {Uint32Array} position_history_hash_parts
  * @param {number} time_budget_ms
  * @returns {number}
  */
-export function search_best_move(board, side_to_move, castling_rights, en_passant_square, time_budget_ms) {
+export function search_best_move(board, side_to_move, castling_rights, en_passant_square, halfmove_clock, position_history_hash_parts, time_budget_ms) {
     const ptr0 = passArray32ToWasm0(board, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.search_best_move(ptr0, len0, side_to_move, castling_rights, en_passant_square, time_budget_ms);
+    const ptr1 = passArray32ToWasm0(position_history_hash_parts, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.search_best_move(ptr0, len0, side_to_move, castling_rights, en_passant_square, halfmove_clock, ptr1, len1, time_budget_ms);
     return ret;
 }
 function __wbg_get_imports() {

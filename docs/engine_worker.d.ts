@@ -1,13 +1,13 @@
 /* tslint:disable */
 /* eslint-disable */
 
-export function search_best_move(board: Int32Array, side_to_move: number, castling_rights: number, en_passant_square: number, time_budget_ms: number): number;
+export function search_best_move(board: Int32Array, side_to_move: number, castling_rights: number, en_passant_square: number, halfmove_clock: number, position_history_hash_parts: Uint32Array, time_budget_ms: number): number;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly search_best_move: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly search_best_move: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
     readonly main: (a: number, b: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
