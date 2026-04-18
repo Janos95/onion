@@ -10,12 +10,32 @@
         height: 100%;
       }
 
+      body {
+        position: relative;
+      }
+
       canvas {
         display: block;
+      }
+
+      .home-link {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        z-index: 10;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.9);
+        color: #111;
+        text-decoration: none;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
       }
     </style>
   </head>
   <body>
+    <a class="home-link" href="https://janos95.github.io/">Home</a>
     <script type="module">
       import init from './onion.js';
 
