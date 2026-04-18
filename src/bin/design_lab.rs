@@ -38,6 +38,8 @@ mod native {
         status: [f32; 4],
         moving_piece_state: [f32; 4],
         moving_piece: [i32; 4],
+        secondary_moving_piece_state: [f32; 4],
+        secondary_moving_piece: [i32; 4],
     }
 
     unsafe impl Zeroable for GpuState {}
@@ -234,6 +236,7 @@ mod native {
         fn from_scenario(
             scenario: &LabScenario,
             moving_piece: Option<MovingPieceVisual>,
+            secondary_moving_piece: Option<MovingPieceVisual>,
             animation_time_seconds: f32,
         ) -> GpuState {
             let mut board = GpuState {
@@ -242,6 +245,8 @@ mod native {
                 status: [0.0, animation_time_seconds, 0.0, 0.0],
                 moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
                 moving_piece: [0; 4],
+                secondary_moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
+                secondary_moving_piece: [0; 4],
             };
 
             for placement in &scenario.extras {
@@ -268,6 +273,22 @@ mod native {
                 ];
             }
 
+            if let Some(moving_piece) = secondary_moving_piece {
+                board.pieces[moving_piece.origin as usize] = Piece::Empty as i32;
+                board.secondary_moving_piece_state = [
+                    1.0,
+                    moving_piece.board_position[0],
+                    moving_piece.board_position[1],
+                    MOVING_PIECE_SMOOTH_UNION_RADIUS,
+                ];
+                board.secondary_moving_piece = [
+                    moving_piece.piece as i32,
+                    moving_piece.target as i32,
+                    moving_piece.captured_piece as i32,
+                    0,
+                ];
+            }
+
             board
         }
 
@@ -282,6 +303,8 @@ mod native {
                 status: [0.0, animation_time_seconds, 0.0, 0.0],
                 moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
                 moving_piece: [0; 4],
+                secondary_moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
+                secondary_moving_piece: [0; 4],
             };
             board.pieces[square as usize] = piece as i32;
             board
@@ -368,12 +391,12 @@ mod native {
         [(square % 8) as f32 + 0.5, (square / 8) as f32 + 0.5]
     }
 
-    fn move_path_position(scenario: &LabScenario, progress: f32) -> [f32; 2] {
-        let from = square_center(scenario.from);
-        let to = square_center(scenario.to);
+    fn move_path_position(piece: Piece, from_square: Square, to_square: Square, progress: f32) -> [f32; 2] {
+        let from = square_center(from_square);
+        let to = square_center(to_square);
         let dx = to[0] - from[0];
         let dy = to[1] - from[1];
-        let is_knight = matches!(scenario.moving_piece, Piece::WhiteKnight | Piece::BlackKnight);
+        let is_knight = matches!(piece, Piece::WhiteKnight | Piece::BlackKnight);
         if is_knight {
             let (corner, first_leg_fraction) = if dx.abs() > dy.abs() {
                 ([to[0], from[1]], 2.0 / 3.0)
@@ -410,13 +433,59 @@ mod native {
         let mut high = 1.0f32;
         for _ in 0..24 {
             let mid = 0.5 * (low + high);
-            if square_boxes_touch(move_path_position(scenario, mid), target_center) {
+            if square_boxes_touch(move_path_position(scenario.moving_piece, scenario.from, scenario.to, mid), target_center) {
                 high = mid;
             } else {
                 low = mid;
             }
         }
         high
+    }
+
+    fn castling_rook_visual(
+        scenario: &LabScenario,
+        raw_progress: f32,
+    ) -> Option<MovingPieceVisual> {
+        let from_file = scenario.from % 8;
+        let to_file = scenario.to % 8;
+        let rank = scenario.from / 8;
+        if !matches!(scenario.moving_piece, Piece::WhiteKing | Piece::BlackKing)
+            || scenario.target_piece != Piece::Empty
+            || scenario.from / 8 != scenario.to / 8
+            || i32::abs(to_file as i32 - from_file as i32) != 2
+        {
+            return None;
+        }
+
+        let rook_piece = match scenario.moving_piece {
+            Piece::WhiteKing => Piece::WhiteRook,
+            Piece::BlackKing => Piece::BlackRook,
+            _ => return None,
+        };
+
+        let (rook_origin, rook_target) = if to_file > from_file {
+            (rank * 8 + 7, rank * 8 + 5)
+        } else {
+            (rank * 8 + 0, rank * 8 + 3)
+        };
+
+        let has_rook = scenario
+            .extras
+            .iter()
+            .any(|placement| placement.square == rook_origin && placement.piece == rook_piece);
+        if !has_rook {
+            return None;
+        }
+
+        let t = raw_progress.clamp(0.0, 1.0);
+        let progress = t * t * (3.0 - 2.0 * t);
+        Some(MovingPieceVisual {
+            origin: rook_origin,
+            piece: rook_piece,
+            board_position: move_path_position(rook_piece, rook_origin, rook_target, progress),
+            target: rook_target,
+            captured_piece: Piece::Empty,
+        })
     }
 
     fn scenario_moving_piece(
@@ -451,23 +520,36 @@ mod native {
         Some(MovingPieceVisual {
             origin: scenario.from,
             piece: scenario.moving_piece,
-            board_position: move_path_position(scenario, path_progress),
+            board_position: move_path_position(scenario.moving_piece, scenario.from, scenario.to, path_progress),
             target: scenario.to,
             captured_piece: scenario.target_piece,
         })
     }
 
     fn scenario_gpu_state(scenario: LabScenario, elapsed_seconds: f32) -> GpuState {
+        let raw_progress = ((elapsed_seconds - SCENARIO_LEAD_IN_SECONDS) / MOVE_ANIMATION_DURATION_SECONDS)
+            .clamp(0.0, 1.0);
         let moving_piece = scenario_moving_piece(&scenario, elapsed_seconds);
+        let secondary_moving_piece = if elapsed_seconds >= SCENARIO_LEAD_IN_SECONDS
+            && elapsed_seconds < SCENARIO_LEAD_IN_SECONDS + MOVE_ANIMATION_DURATION_SECONDS
+        {
+            castling_rook_visual(&scenario, raw_progress)
+        } else {
+            None
+        };
         let board = if elapsed_seconds
             >= SCENARIO_LEAD_IN_SECONDS + MOVE_ANIMATION_DURATION_SECONDS
         {
-            let mut board = GpuState::from_scenario(&scenario, None, elapsed_seconds);
+            let mut board = GpuState::from_scenario(&scenario, None, None, elapsed_seconds);
             board.pieces[scenario.from as usize] = Piece::Empty as i32;
             board.pieces[scenario.to as usize] = scenario.moving_piece as i32;
+            if let Some(rook) = castling_rook_visual(&scenario, 1.0) {
+                board.pieces[rook.origin as usize] = Piece::Empty as i32;
+                board.pieces[rook.target as usize] = rook.piece as i32;
+            }
             board
         } else {
-            GpuState::from_scenario(&scenario, moving_piece, elapsed_seconds)
+            GpuState::from_scenario(&scenario, moving_piece, secondary_moving_piece, elapsed_seconds)
         };
         board
     }
@@ -664,7 +746,7 @@ mod native {
                 Some(mode) => GpuState::from_single_piece(mode.piece, mode.square, 0.0),
                 None => {
                     let scenarios = &hot_scenarios.as_ref().unwrap().scenarios;
-                    GpuState::from_scenario(&scenarios[0], None, 0.0)
+                    GpuState::from_scenario(&scenarios[0], None, None, 0.0)
                 }
             }
             .as_byte_slice(),

@@ -229,6 +229,8 @@ struct GpuState {
     status: [f32; 4],
     moving_piece_state: [f32; 4],
     moving_piece: [i32; 4],
+    secondary_moving_piece_state: [f32; 4],
+    secondary_moving_piece: [i32; 4],
 }
 
 unsafe impl Zeroable for GpuState {}
@@ -260,6 +262,8 @@ impl GpuState {
             ],
             moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
             moving_piece: [0; 4],
+            secondary_moving_piece_state: [0.0, 0.0, 0.0, MOVING_PIECE_SMOOTH_UNION_RADIUS],
+            secondary_moving_piece: [0; 4],
         };
         for square in 0..64 {
             board.pieces[square] = position.piece_at(square as Square) as i32;

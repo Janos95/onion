@@ -14,6 +14,8 @@ struct uniforms {
     status: vec4<f32>,
     moving_piece_state: vec4<f32>,
     moving_piece: vec4<i32>,
+    secondary_moving_piece_state: vec4<f32>,
+    secondary_moving_piece: vec4<i32>,
 };
 
 @group(0)
@@ -465,17 +467,39 @@ fn fs_main(vertex: vertexoutput) -> @location(0) vec4<f32> {
         capture_target_color,
         is_capture_target_square,
     );
+    let secondary_moving_piece_active = state.secondary_moving_piece_state.x > 0.5;
+    let secondary_moving_piece_center = state.secondary_moving_piece_state.yz;
+    let secondary_blend_k = state.secondary_moving_piece_state.w;
+    let secondary_moving_piece = state.secondary_moving_piece.x;
+    let d_secondary_moving =
+        dispatch_piece_code(2.0 * (v2(x, y) - secondary_moving_piece_center), secondary_moving_piece);
+    let secondary_moving_piece_color = piece_color_from_code(secondary_moving_piece);
+    let secondary_moving_piece_blend = select(
+        1.0,
+        op_smooth_union_blend(d_composed, d_secondary_moving, secondary_blend_k),
+        secondary_moving_piece_active,
+    );
+    let d_final = select(
+        d_composed,
+        op_smooth_union(d_composed, d_secondary_moving, secondary_blend_k),
+        secondary_moving_piece_active,
+    );
+    let final_piece_color = select(
+        base_piece_color,
+        mix(secondary_moving_piece_color, base_piece_color, secondary_moving_piece_blend),
+        secondary_moving_piece_active,
+    );
 
     var col : v3;
-    if d_composed < 0.0 {
-        col = base_piece_color;
+    if d_final < 0.0 {
+        col = final_piece_color;
     }
     else {
         col = square;
     }
 
-    let outline_width = 3.0 * max(fwidth(d_composed), 0.002);
-    let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_composed));
+    let outline_width = 3.0 * max(fwidth(d_final), 0.002);
+    let outline = 1.0 - smoothstep(0.0, outline_width, abs(d_final));
     let outline_color = select(vec3(0.0), selected_outline, is_selected_piece);
     col = mix(col, outline_color, outline);
 

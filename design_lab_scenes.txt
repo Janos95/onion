@@ -9,4 +9,6 @@
 # Black Queen x Rook | q | f6 | c3 | R | -
 # Knight over White Pawn | N | b1 | c3 | . | b2:P
 Knight over Black Pawn | N | g1 | f3 | . | g2:p
+White Castle Kingside | K | e1 | g1 | . | h1:R
+White Castle Queenside | K | e1 | c1 | . | a1:R
 # Bishop through Mixed Line | B | c1 | g5 | . | d2:P, e3:p, f4:N
