@@ -2,13 +2,8 @@
 # pieces: P p N n B b R r Q q K k .  (or WhitePawn / BlackQueen / Empty)
 # extras: comma-separated square:piece pairs, or -
 
-# Pawn x Pawn | P | d4 | e5 | p | -
-# Knight x Bishop | N | c3 | d5 | b | -
-# Bishop x Knight | B | b2 | e5 | n | -
-# Rook x Queen | R | b4 | f4 | q | -
-# Black Queen x Rook | q | f6 | c3 | R | -
-# Knight over White Pawn | N | b1 | c3 | . | b2:P
-Knight over Black Pawn | N | g1 | f3 | . | g2:p
-White Castle Kingside | K | e1 | g1 | . | h1:R
-White Castle Queenside | K | e1 | c1 | . | a1:R
-# Bishop through Mixed Line | B | c1 | g5 | . | d2:P, e3:p, f4:N
+White Knight Over White Pawn | N | g1 | f3 | . | e1:K,d1:Q,a1:R,h1:R,c1:B,f1:B,b1:N,a2:P,b2:P,c4:P,d4:P,e3:P,f2:P,g2:P,h2:P,e8:k,d8:q,a8:r,h8:r,c8:b,f8:b,b8:n,f6:n,a7:p,b7:p,c5:p,d5:p,e6:p,f7:p,g7:p,h7:p
+White Castle Queenside | K | e1 | c1 | . | a1:R,h1:R,d2:Q,e3:B,d3:B,c3:N,f3:N,a2:P,b2:P,c2:P,e4:P,f2:P,g2:P,h2:P,g4:P,h4:P,e8:k,a5:q,a8:r,h8:r,g7:b,c8:b,c6:n,f6:n,a6:p,b5:p,c5:p,d6:p,e6:p,f7:p,g6:p,h7:p
+White Bishop Captures Knight | B | b2 | e5 | n | g1:K,c2:Q,a1:R,f1:R,g2:B,d2:N,f3:N,a2:P,b3:P,c4:P,e3:P,f2:P,g3:P,h2:P,g8:k,d8:q,a8:r,f8:r,g7:b,c8:b,c6:n,a7:p,b7:p,c7:p,d6:p,e6:p,f7:p,g6:p,h7:p
+White Rook Captures Queen | R | b4 | f4 | q | g1:K,d1:Q,f1:R,g2:B,e2:B,c3:N,f3:N,a2:P,b2:P,c2:P,d3:P,f2:P,g3:P,h2:P,g8:k,a8:r,h8:r,g7:b,c8:b,c6:n,f6:n,a7:p,b7:p,c7:p,d6:p,e5:p,g6:p,h7:p
+Black Queen Captures Rook | q | f6 | c3 | R | g1:K,d2:Q,a1:R,e2:B,g2:B,f3:N,c4:N,a2:P,b2:P,c2:P,d3:P,e4:P,f2:P,g3:P,h2:P,g8:k,a8:r,h8:r,g7:b,c8:b,c6:n,d7:n,a7:p,b7:p,c7:p,d6:p,e6:p,f7:p,g6:p,h7:p

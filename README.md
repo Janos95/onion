@@ -3,6 +3,8 @@
 Simple chess engine using an sdf based rendering. 
 Play [here](https://janos95.github.io/onion/), but beaware, it might make you cry :)
 
+![SDF chess showcase](sdf_chess.gif)
+
 ## Local
 
 - Run the app: `cargo run`
